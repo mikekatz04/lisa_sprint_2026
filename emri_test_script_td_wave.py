@@ -213,14 +213,15 @@ if __name__ == "__main__":
     # this is the necessary parameter order for input into the FEW legacy waveform
     inj_params = np.array([m1, m2, a, p0, e0, xI0, dist, qS, phiS, qK, phiK, Phi_phi0, Phi_theta0, Phi_r0])
 
-    tdi_channels_tof = emri_gen_tof(*inj_params)
-    new_t = t_start + np.arange(10000) * dt
-    _tdi_here_tof = tdi_channels_tof.eval_tdi(new_t)
-    tdi_here_tof = np.sum(_tdi_here_tof, axis=0)
-    plt.plot(tdi_here_tof[0])
-    plt.show()
-    plt.close()
-    breakpoint()
+    # EMRI TOF
+    # tdi_channels_tof = emri_gen_tof(*inj_params)
+    # new_t = t_start + np.arange(10000) * dt
+    # _tdi_here_tof = tdi_channels_tof.eval_tdi(new_t)
+    # tdi_here_tof = np.sum(_tdi_here_tof, axis=0)
+    # plt.plot(tdi_here_tof[0])
+    # plt.show()
+    # plt.close()
+    # breakpoint()
 
     # just in case the time grids do not align
     _fake_data = (np.arange(10000) - int(10000 / 2)) * dt + t_arr[0]

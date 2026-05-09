@@ -16,9 +16,7 @@ except (ImportError, ModuleNotFoundError):
     backend = 'cpu'
 
 # from lisatools.globalfit.preprocessing import L1ProcessingStep
-from preprocessing import L1ProcessingStep
 from phentax.waveform import IMRPhenomTHM
-from lisatools.detector import L1Orbits
 
 from lisaconstants import ASTRONOMICAL_YEAR
 import matplotlib.pyplot as plt

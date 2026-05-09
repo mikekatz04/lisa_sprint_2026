@@ -1,23 +1,29 @@
-# CD1L validation notebooks
+# Global Fit Development
 
-This installation is slightly different than with uv. We will work to bring them together. 
+This replicates the development setup for NSGS pipeline development for the CD1-L (Mojito) data. The scripts included are a *small* \Delta away from the full global fit setup we will soon be running. 
 
-**Notes for install**: this currently installs the analysis tools including only GB waveforms. The MBH waveforms are in a private repo (not Michael's) that I am working on making public. In order to install the EMRI waveforms, you should uncomment the final block in the `notebooks/install.sh` file. This will install the proper branch of FEW. However, this can take awhile even with the proper Lapacke setup, so I have commented it out for now. 
+It includes 3 scripts pe: `gb_test_script_td_wave.py`, `emri_test_script_td_wave.py`, `mbh_test_script_td_wave.py`.
 
-**Note on Mojito package**: you will have to install the [Mojito package](https://mojito-e66317.io.esa.int). I had to request access and install from source from the gitlab to get it to work right. Otherwise, we may want to rewrite i/o operations on the cd1-L dataset to creat our own i/o functions (not the best option in my opinion). 
+These files include MCMC examples with the pipeline infrastructure for EMRIs, MBHs, and GBs (single GBs in this example). It include TDI-on-the-fly (from Neil and Tyson) and an implementation for the WDM domain. 
+
+There is also the file `gb_lookup_table_test_script.py`. This file still needs some work and bug fixes that will hopefully be done by Monday. But it shows the lookup table method for generating GB waveforms (and hopefully eventually EMRI waveforms). 
+
+**Notes for install**: this currently installs the LISA analysis tools development setup. The MBH waveforms are in a public repo from Alessandro Santini. In order to install the EMRI waveforms, you should uncomment the final block in the `install.sh` file. This will install the proper branch of FEW. However, this can take awhile even with the proper Lapacke setup, so I have commented it out for now. 
+
+**GPUs**: This setup may run on GPUs. It may require a few bug fixes. If you try this, please let Michael Katz know how it goes. 
 
 Steps for install:
 
 1. Clone the cd1-L repo and change to notebooks directory:
 ```
-git clone https://github.com/lisa-analysis-center/cd1l-validation.git
-cd cd1l-validation/notebooks/
+git clone https://github.com/mikekatz04/sprint_2026.git
+cd sprint_2026/
 ```
 
 2. Generate a `virtualenv` (or something similar with conda).
 ```
-python -m venv /path/to/cd1l_env
-source activate /path/to/cd1l_env
+python -m venv /path/to/sprint_env
+source activate /path/to/sprint_env
 ```
 
 3. If you have lapacke installed on your local machine, you should add it to cmake package config. For example, I have lapacke installed with brew:
@@ -39,7 +45,7 @@ Alternatively, you can pass the compilers directly via pip without modifying you
 bash install.sh
 ```
 
-5. Run the notebook:
+5. Run the one of the scripts:
 ```
-jupyter notebook CD1-L-validation-gb.ipynb
+python mbh_test_script_td_wave.py
 ```
