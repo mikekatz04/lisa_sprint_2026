@@ -16,8 +16,8 @@ Steps for install:
 
 1. Clone the cd1-L repo and change to notebooks directory:
 ```
-git clone https://github.com/mikekatz04/sprint_2026.git
-cd sprint_2026/
+git clone https://github.com/mikekatz04/lisa_sprint_2026.git
+cd lisa_sprint_2026/
 ```
 
 2. Generate a `virtualenv` (or something similar with conda).
