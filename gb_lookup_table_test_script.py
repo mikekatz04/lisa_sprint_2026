@@ -43,7 +43,7 @@ import os
 
     # HIGHLY RECOMMEND RUNNING THESE THINGS IN A SCRIPT IN THE TERMINAL, OTHERWISE BE CAREFUL TO RUN CELLS IN ORDER AS MUCH AS POSSIBLE
 
-
+import time
 class GBLookupWaveWrap:
     def __init__(self, t_arr, t_tdi_sparse, Tobs, t_ref, dt, num_bin, gb_tdi_kwargs, td_set, output_set, td_window):
         self.t_arr, self.t_tdi_sparse = t_arr, t_tdi_sparse
@@ -52,15 +52,21 @@ class GBLookupWaveWrap:
         assert isinstance(output_set, WDMSettings)
         self.td_window = td_window
 
+        # TODO: maybe redo this?
+        self.gb_gen = GBTDIonTheFly(
+            self.t_tdi_sparse, self.Tobs, self.t_ref, self.dt, 1,
+            **self.gb_tdi_kwargs
+        )
+
     def __call__(self, *params):
         
         params = np.asarray([params])
         assert params.shape[-1] == 9
-        gb_gen_tmp = GBTDIonTheFly(
-            self.t_tdi_sparse, self.Tobs, self.t_ref, self.dt, params.shape[0],
-            **self.gb_tdi_kwargs
-        )
-        wave_tmp = gb_gen_tmp(*params.T, convert_to_ra_dec=False, return_spline=True)
+        # st = time.perf_counter()
+
+        # print("check 1", time.perf_counter() - st)
+        # st = time.perf_counter()
+        wave_tmp = self.gb_gen(*params.T, convert_to_ra_dec=False, return_spline=True)
 
         t_arr = self.output_set.t_arr + self.t_ref
         f_deriv_tdi = wave_tmp.tdi_phase_spl(np.tile(t_arr, (1, 3, 1)), derivative=1)[0] / (2 * np.pi)
@@ -71,10 +77,12 @@ class GBLookupWaveWrap:
         fdot_deriv_ref = wave_tmp.phase_ref_spl(t_arr[None, :], derivative=2)[0]  / (2 * np.pi)
         fdot_deriv = fdot_deriv_ref + fdot_deriv_tdi
 
-        tdi_amp = wave_tmp.tdi_amp_spl(np.tile(t_arr, (1, 3, 1)))[0] / (2 * np.pi)
-        tdi_phase = wave_tmp.tdi_phase_spl(np.tile(t_arr, (1, 3, 1)))[0] / (2 * np.pi)
-        ref_phase = wave_tmp.phase_ref_spl(t_arr[None, :])[0]  / (2 * np.pi)
+        tdi_amp = wave_tmp.tdi_amp_spl(np.tile(t_arr, (1, 3, 1)))[0]
+        tdi_phase = wave_tmp.tdi_phase_spl(np.tile(t_arr, (1, 3, 1)))[0]
+        ref_phase = wave_tmp.phase_ref_spl(t_arr[None, :])[0]
         
+        # print("check 2", time.perf_counter() - st)
+        # st = time.perf_counter()
         # breakpoint()
         # check_tdi_full = wave_tmp.eval_tdi(t_arr)
         # check_tdi_phase = -np.angle(check_tdi_full * np.exp(1j * ref_phase))
@@ -107,11 +115,15 @@ class GBLookupWaveWrap:
         keep_n = (m_layers >= wdm_set.ind_min_f) & (m_layers <= wdm_set.ind_max_f)
         keep = keep_m & keep_n
 
+        # print("check 3", time.perf_counter() - st)
+        # st = time.perf_counter()
         channel_ind = np.repeat(np.arange(3)[:, None], m_layers.shape[-1] * m_layers.shape[-2], axis=-1).reshape(m_layers.shape)
-        gb_fill_wave[channel_ind[keep], m_layers[keep], n_layers[keep]] = wdm_coeffs[keep]
+        gb_fill_wave[channel_ind[keep], m_layers[keep] - m_min, n_layers[keep] - n_min] = wdm_coeffs[keep]
         # gb_fill_wave[:] = xp.roll(gb_fill_wave, 2, axis=-1)
-
+        # print("check 4", time.perf_counter() - st)
+        # st = time.perf_counter()
         gb_fill_wave_wdm = WDMSignal(gb_fill_wave, self.output_set)
+        # print("check 5", time.perf_counter() - st)
         return gb_fill_wave_wdm
 
 
@@ -121,10 +133,14 @@ if __name__ == "__main__":
     xp = np if backend == "cpu" else cp
 
     orbits = ESAOrbits(force_backend=backend)
-    dt = 10.0  # mojito
+    dt = 2.5  # mojito
     _Tobs = 1. * YRSID_SI
     # between half day and 3/4 day. Will be very close to half day
-    (Nf, Nt, wavelet_duration) = WDMSettings.adjust_to_even_bins(0.5 * 24 * 3600.0, 0.75 * 24 * 3600.0, dt, _Tobs)
+    # (Nf, Nt, wavelet_duration) = WDMSettings.adjust_to_even_bins(0.5 * 24 * 3600.0, 0.75 * 24 * 3600.0, dt, _Tobs)
+    Nt = 1460
+    Nf = 17292
+
+    wavelet_duration = Nf * dt
     Tobs = Nt * wavelet_duration
     Nobs = Nf * Nt
 
@@ -175,13 +191,14 @@ if __name__ == "__main__":
     df = freqs[1] - freqs[0]
     N_fd = len(freqs)
     window = xp.asarray(signal.windows.tukey(N, alpha=0.05))
-    min_freq = None  # 0.0005
-    max_freq = None  # 0.03
+
+    min_freq = 0.0029493407356002777  # 255 * wdm_set.layer_df
+    max_freq = 0.00306500115660421  # 265 * wdm_set.layer_df
     fd_set = FDSettings(N_fd, df, min_freq=min_freq, max_freq=max_freq, force_backend=backend)
 
     # shave edges?
-    min_time = None  # 10 * wavelet_duration
-    max_time = None  # (Nt - 10) * wavelet_duration
+    min_time = 10 * wavelet_duration
+    max_time = (Nt - 10) * wavelet_duration
 
     wdm_set = WDMSettings(Nf, Nt, dt, min_freq=min_freq, max_freq=max_freq, min_time=min_time, max_time=max_time)
     inj_tmp = gb_gen_inj(amp, f0, fdot, fddot, phi0, inc, psi, lam, beta, convert_to_ra_dec=False, return_spline=True)
@@ -202,18 +219,16 @@ if __name__ == "__main__":
     injection = DataResidualArray(data_inj_all)
     sens_mat = XYZ2SensitivityMatrix(injection.data_res_arr.settings, model="scirdv1")
 
-    analysis = AnalysisContainer(injection, sens_mat)
-
+    
     ## mcmc functions
 
-    store_path = "test_wdm_lookup_table.h5"
+    store_path = "wdm_lookup_new_test_5.h5"
         
     ## lookup table setup
     if os.path.exists(store_path):
         wdm_lookup_table = WDMLookupTable.from_file(store_path, force_backend=backend)
         _wdm_settings = WDMSettings(*wdm_lookup_table.args, **wdm_lookup_table.kwargs)
-
-        if _wdm_settings.eq_without_inds(wdm_set):
+        if not _wdm_settings.eq_without_inds(wdm_set):
             raise ValueError("WDM Settings are not equivalent to lookup table. Either adjust to lookup table settings or regenerate the table.")
 
         # Nt = wdm_settings.Nt
@@ -238,7 +253,7 @@ if __name__ == "__main__":
     N_sparse = 2048
     t_tdi_sparse = xp.linspace(t_arr[0], t_arr[-1], N_sparse)
 
-    gb_comps = GBWDMComputations(wdm_lookup_table, Tobs, t_ref, orbits=orbits, tdi_config=tdi_config, force_backend=backend)
+    # gb_comps = GBWDMComputations(wdm_lookup_table, Tobs, t_ref, orbits=orbits, tdi_config=tdi_config, force_backend=backend)
     gb_gen_wrap = GBLookupWaveWrap(
         t_arr, 
         t_tdi_sparse, 
@@ -252,33 +267,36 @@ if __name__ == "__main__":
         window
     )
 
+    analysis = AnalysisContainer(injection, sens_mat, signal_gen=gb_gen_wrap)
+
     wdm_holder = AnalysisContainerArray([analysis])
 
     template_fill = xp.zeros(3 * np.prod(wdm_set.basis_shape_active), dtype=float)
-    gb_comps.fill_global_wdm(template_fill, params, wdm_holder, data_index=None)
+    # gb_comps.fill_global_wdm(template_fill, params, wdm_holder, data_index=None)
     template_fill_wdm = WDMSignal(template_fill.reshape((3,) + wdm_set.basis_shape_active), wdm_set)
-    gb_comps.d_d = analysis.inner_product()
-    check_ll = gb_comps.get_ll_wdm(params, wdm_holder, data_index=None, noise_index=None)
-    check_opt_snr = gb_comps.h_h_out[0].item() ** (1/2)
+    # gb_comps.d_d = analysis.inner_product()
+    # check_ll = gb_comps.get_ll_wdm(params, wdm_holder, data_index=None, noise_index=None)
+    # check_opt_snr = gb_comps.h_h_out[0].item() ** (1/2)
     check_ll_2 = analysis.template_likelihood(template_fill_wdm)  # template_likelihood ignores psd likelihood by default
     check_ip_2 = analysis.template_inner_product(template_fill_wdm)
 
     py_wdm_lookup = gb_gen_wrap(params)
-    analysis.template_inner_product(py_wdm_lookup)
+    tmp_val1 = analysis.template_inner_product(py_wdm_lookup)
+    tmp_val2 = analysis.calculate_signal_inner_product(*params)
+    # breakpoint()
+    # plt.rcParams['text.usetex'] = False
+    # fig, (ax1, ax2, ax3) = plt.subplots(3, 1, sharex=True, sharey=True)
 
-    plt.rcParams['text.usetex'] = False
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, sharex=True, sharey=True)
-
-    template_fill_wdm.heatmap(fig=fig, ax=ax2, index=0, add_cax=True)
-    injection.data_res_arr.heatmap(fig=fig, ax=ax1, index=0)
-    py_wdm_lookup.heatmap(fig=fig, ax=ax3, index=0)
-    plt.show()
-    plt.close()
-    breakpoint()
-    analysis_mcmc = AnalysisContainer(injection, sens_mat)
+    # template_fill_wdm.heatmap(fig=fig, ax=ax2, index=0, add_cax=True)
+    # injection.data_res_arr.heatmap(fig=fig, ax=ax1, index=0)
+    # py_wdm_lookup.heatmap(fig=fig, ax=ax3, index=0)
+    # plt.show()
+    # plt.close()
+    # breakpoint()
+    analysis_mcmc = AnalysisContainer(injection, sens_mat, signal_gen=gb_gen_wrap)
     
-    ntemps = 2
-    nwalkers = 2
+    ntemps = 10
+    nwalkers = 20
 
 
     # The order here defines full_basis — must never change
@@ -323,7 +341,7 @@ if __name__ == "__main__":
     })}
 
 
-    factor_gen = 1e-5
+    factor_gen = 1e-2
 
     gen_dist = {"gb": ProbDistContainer({
         "amp": uniform_dist(amp[0] * (1.0 - factor_gen), amp[0] * (1.0 + factor_gen)),
@@ -362,19 +380,19 @@ if __name__ == "__main__":
         backend=fp
     )
 
-    breakpoint()
     if start_state.log_like is None:
         start_state.log_prior = sampler.compute_log_prior(start_state.branches_coords)
         start_state.log_like = sampler.compute_log_like(start_state.branches_coords, logp=start_state.log_prior)[0]
 
     print("start log_like: ", start_state.log_like)
     
-    # inj_params = params[0, tc.test_inds].copy()
-    # inj_params[sampled_basis.index("cosinc")] = np.cos(inj_params[sampled_basis.index("cosinc")])
-    # inj_params[sampled_basis.index("sinbeta")] = np.sin(inj_params[sampled_basis.index("sinbeta")])
-    # tmp_state = State({"gb": np.tile(inj_params, (ntemps, nwalkers, 1, 1))})
-    # best_like = sampler.compute_log_like(tmp_state.branches_coords)
-
+    inj_params = params[0, tc.test_inds].copy()
+    inj_params[sampled_basis.index("cosinc")] = np.cos(inj_params[sampled_basis.index("cosinc")])
+    inj_params[sampled_basis.index("sinbeta")] = np.sin(inj_params[sampled_basis.index("sinbeta")])
+    tmp_state = State({"gb": np.tile(inj_params, (ntemps, nwalkers, 1, 1))})
+    best_like = sampler.compute_log_like(tmp_state.branches_coords)[0]
+    print("best_like: ", best_like)
+    
     nsteps = 2000
     burn = 0
     output_state = sampler.run_mcmc(start_state, nsteps=nsteps, burn=burn, thin_by=5, progress=True)
