@@ -222,7 +222,7 @@ if __name__ == "__main__":
     
     ## mcmc functions
 
-    store_path = "wdm_lookup_new_test_5.h5"
+    store_path = "wdm_lookup_new_all_time_layers_1.h5"
         
     ## lookup table setup
     if os.path.exists(store_path):
@@ -246,14 +246,14 @@ if __name__ == "__main__":
         # fdot_vals = WDMLookupTable.apply_eps_fdot(0.2, wdm_set, fdot_max_factor=1.0) 
 
         nchannel = 3
-        wdm_lookup_table = WDMLookupTable(wdm_set, nchannel, norm_freq_single_layer=norm_freq_single_layer, m_diffs=m_diffs, fdot_vals=fdot_vals, m_ref=m_ref, time_layers=time_layers, batch_size_gen=5, td_window=td_window, store_path=store_path)
+        wdm_lookup_table = WDMLookupTable(wdm_set, nchannel, norm_freq_single_layer=norm_freq_single_layer, m_diffs=m_diffs, fdot_vals=fdot_vals, m_ref=m_ref, batch_size_gen=5, td_window=td_window, store_path=store_path)
 
     # this tests cubic spline accuracy for python setup
     # C setup currently does central differencing at the wdm grid
     N_sparse = 2048
     t_tdi_sparse = xp.linspace(t_arr[0], t_arr[-1], N_sparse)
 
-    # gb_comps = GBWDMComputations(wdm_lookup_table, Tobs, t_ref, orbits=orbits, tdi_config=tdi_config, force_backend=backend)
+    gb_comps = GBWDMComputations(wdm_lookup_table, Tobs, t_ref, orbits=orbits, tdi_config=tdi_config, force_backend=backend)
     gb_gen_wrap = GBLookupWaveWrap(
         t_arr, 
         t_tdi_sparse, 
@@ -272,7 +272,8 @@ if __name__ == "__main__":
     wdm_holder = AnalysisContainerArray([analysis])
 
     template_fill = xp.zeros(3 * np.prod(wdm_set.basis_shape_active), dtype=float)
-    # gb_comps.fill_global_wdm(template_fill, params, wdm_holder, data_index=None)
+    breakpoint()
+    gb_comps.fill_global_wdm(template_fill, params, wdm_holder, data_index=None)
     template_fill_wdm = WDMSignal(template_fill.reshape((3,) + wdm_set.basis_shape_active), wdm_set)
     # gb_comps.d_d = analysis.inner_product()
     # check_ll = gb_comps.get_ll_wdm(params, wdm_holder, data_index=None, noise_index=None)
@@ -281,18 +282,19 @@ if __name__ == "__main__":
     check_ip_2 = analysis.template_inner_product(template_fill_wdm)
 
     py_wdm_lookup = gb_gen_wrap(params)
+    # breakpoint()
     tmp_val1 = analysis.template_inner_product(py_wdm_lookup)
     tmp_val2 = analysis.calculate_signal_inner_product(*params)
     # breakpoint()
-    # plt.rcParams['text.usetex'] = False
-    # fig, (ax1, ax2, ax3) = plt.subplots(3, 1, sharex=True, sharey=True)
+    plt.rcParams['text.usetex'] = False
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, sharex=True, sharey=True)
 
-    # template_fill_wdm.heatmap(fig=fig, ax=ax2, index=0, add_cax=True)
-    # injection.data_res_arr.heatmap(fig=fig, ax=ax1, index=0)
-    # py_wdm_lookup.heatmap(fig=fig, ax=ax3, index=0)
-    # plt.show()
-    # plt.close()
-    # breakpoint()
+    template_fill_wdm.heatmap(fig=fig, ax=ax2, index=0, add_cax=True)
+    injection.data_res_arr.heatmap(fig=fig, ax=ax1, index=0)
+    py_wdm_lookup.heatmap(fig=fig, ax=ax3, index=0)
+    plt.show()
+    plt.close()
+    breakpoint()
     analysis_mcmc = AnalysisContainer(injection, sens_mat, signal_gen=gb_gen_wrap)
     
     ntemps = 10
@@ -357,7 +359,7 @@ if __name__ == "__main__":
     ndims = {"gb": len(sampled_basis)}
 
     periodic_container = PeriodicContainer({"gb": {"phi0": 2 * np.pi, "psi": np.pi, "lam": 2 * np.pi}}, key_order={"gb": sampled_basis})
-    fp = f"test_gb_lookup_pe.h5"
+    fp = f"test_gb_lookup_pe_new_new_1.h5"
     if os.path.exists(fp):
         file_backend = HDFBackend(fp)
         start_state = file_backend.get_last_sample()
