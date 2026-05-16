@@ -4,7 +4,13 @@
 # In[1]:
 
 
+import os, sys
 import numpy as np
+import matplotlib
+# Use Agg by default so the verification run is non-interactive. If the user
+# wants the heatmap window, they can override with MPLBACKEND=Qt5Agg etc.
+if not os.environ.get("MPLBACKEND"):
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy import signal
 
@@ -37,7 +43,6 @@ from eryn.utils import PeriodicContainer
 
 from eryn.state import State
 from eryn.backends import HDFBackend
-import os
 # credit Michael Katz and Alessandro Santini (with internal code contrubtions in docs)
 
 
@@ -133,12 +138,12 @@ if __name__ == "__main__":
     xp = np if backend == "cpu" else cp
 
     orbits = ESAOrbits(force_backend=backend)
-    dt = 2.5  # mojito
+    dt = 10.0  # mojito
     _Tobs = 1. * YRSID_SI
     # between half day and 3/4 day. Will be very close to half day
     # (Nf, Nt, wavelet_duration) = WDMSettings.adjust_to_even_bins(0.5 * 24 * 3600.0, 0.75 * 24 * 3600.0, dt, _Tobs)
-    Nt = 1460
-    Nf = 17292
+    Nt = 256
+    Nf = 1460
 
     wavelet_duration = Nf * dt
     Tobs = Nt * wavelet_duration
@@ -172,7 +177,7 @@ if __name__ == "__main__":
     )
 
     num_bin = 1
-    amp = np.full(num_bin, 8.0e-23)
+    amp = np.full(num_bin, 8.0e-22)
     f0 = np.full(num_bin, 3.0e-3)  # (ind + i / num) * wdm_settings.layer_df)
     fdot = np.full(num_bin, 1e-16)
     fddot = np.full(num_bin, 0.0)
@@ -197,8 +202,8 @@ if __name__ == "__main__":
     fd_set = FDSettings(N_fd, df, min_freq=min_freq, max_freq=max_freq, force_backend=backend)
 
     # shave edges?
-    min_time = 10 * wavelet_duration
-    max_time = (Nt - 10) * wavelet_duration
+    min_time = 0 * wavelet_duration
+    max_time = (Nt - 0) * wavelet_duration
 
     wdm_set = WDMSettings(Nf, Nt, dt, min_freq=min_freq, max_freq=max_freq, min_time=min_time, max_time=max_time)
     inj_tmp = gb_gen_inj(amp, f0, fdot, fddot, phi0, inc, psi, lam, beta, convert_to_ra_dec=False, return_spline=True)
@@ -240,7 +245,7 @@ if __name__ == "__main__":
         time_layers = wdm_set.Nt
         td_window = xp.asarray(signal.windows.tukey(wdm_set.Nf * time_layers, alpha=0.05))
         m_ref = int(3e-3 / wdm_set.layer_df)
-        norm_freq_single_layer, m_diffs, _ = WDMLookupTable.apply_eps_frequency(0.0025, wdm_set, m_ref=m_ref, num_layers_diff=5)
+        norm_freq_single_layer, m_diffs, _ = WDMLookupTable.apply_eps_frequency(0.0005, wdm_set, m_ref=m_ref, num_layers_diff=5)
             
         fdot_vals = np.array([0.0])
         # fdot_vals = WDMLookupTable.apply_eps_fdot(0.2, wdm_set, fdot_max_factor=1.0) 
@@ -272,29 +277,72 @@ if __name__ == "__main__":
     wdm_holder = AnalysisContainerArray([analysis])
 
     template_fill = xp.zeros(3 * np.prod(wdm_set.basis_shape_active), dtype=float)
-    breakpoint()
-    gb_comps.fill_global_wdm(template_fill, params, wdm_holder, data_index=None)
+    # Pass convert_to_ra_dec=False so the C kernel uses the same ecliptic frame
+    # as the injection and Python wrap (default would apply ecliptic→ICRS, shifting
+    # the source location and making C and Python results diverge).
+    gb_comps.fill_global_wdm(template_fill, params, wdm_holder, data_index=None, convert_to_ra_dec=False)
     template_fill_wdm = WDMSignal(template_fill.reshape((3,) + wdm_set.basis_shape_active), wdm_set)
-    # gb_comps.d_d = analysis.inner_product()
-    # check_ll = gb_comps.get_ll_wdm(params, wdm_holder, data_index=None, noise_index=None)
-    # check_opt_snr = gb_comps.h_h_out[0].item() ** (1/2)
     check_ll_2 = analysis.template_likelihood(template_fill_wdm)  # template_likelihood ignores psd likelihood by default
     check_ip_2 = analysis.template_inner_product(template_fill_wdm)
+    check_ip_d_d = analysis.inner_product()
 
-    py_wdm_lookup = gb_gen_wrap(params)
-    # breakpoint()
+    # The wrap's __call__ takes the 9 scalar params as *args (see GBLookupWaveWrap above).
+    py_wdm_lookup = gb_gen_wrap(*params[0])
     tmp_val1 = analysis.template_inner_product(py_wdm_lookup)
-    tmp_val2 = analysis.calculate_signal_inner_product(*params)
-    # breakpoint()
+    tmp_val2 = analysis.calculate_signal_inner_product(*params[0])
+
+    print(f"\n[result] base inner_product <d|d>            = {check_ip_d_d}")
+    print(f"[result] template_inner_product (C lookup)     = {check_ip_2}")
+    print(f"[result] template_inner_product (py lookup)    = {tmp_val1}")
+    print(f"[result] calculate_signal_inner_product        = {tmp_val2}")
+    print(f"[result] template_likelihood (C lookup)        = {check_ll_2}\n")
+
+    # Per-channel AET cross-check: convert XYZ → AET in WDM space and compare
+    # each orthogonal AET channel separately (they decouple under AET1Sens).
+    from lisatools.sensitivity import AET1SensitivityMatrix
+    def xyz_to_aet(arr):
+        X, Y, Z = arr[0], arr[1], arr[2]
+        A = (Z - X) / np.sqrt(2.0)
+        E = (X - 2.0 * Y + Z) / np.sqrt(6.0)
+        T = (X + Y + Z) / np.sqrt(3.0)
+        return np.stack([A, E, T], axis=0)
+    inj_aet = xyz_to_aet(injection.data_res_arr.arr)
+    c_tpl_aet = xyz_to_aet(template_fill_wdm.arr)
+    py_tpl_aet = xyz_to_aet(py_wdm_lookup.arr)
+    sens_aet = AET1SensitivityMatrix(WDMSignal(inj_aet, wdm_set).settings)
+    invC = sens_aet.invC
+    prefactor = 4.0 * sens_aet.differential_component
+    print(f"==== per-channel AET inner products ====")
+    print(f"{'chan':6s} {'<d|d>':>12s} {'<d|h_C>':>12s} {'<d|h_py>':>12s} {'r_C':>9s} {'r_py':>9s}")
+    for chan, name in enumerate("AET"):
+        d_c = inj_aet[chan]; hC = c_tpl_aet[chan]; hPy = py_tpl_aet[chan]; ic = invC[chan]
+        dd = (d_c*d_c*ic).sum()*prefactor
+        dhC = (d_c*hC*ic).sum()*prefactor
+        dhPy = (d_c*hPy*ic).sum()*prefactor
+        print(f"  {name:4s} {dd:+12.4e} {dhC:+12.4e} {dhPy:+12.4e} "
+              f"{(dhC/dd if dd!=0 else float('nan')):+9.4f} "
+              f"{(dhPy/dd if dd!=0 else float('nan')):+9.4f}")
+    print()
+
     plt.rcParams['text.usetex'] = False
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, sharex=True, sharey=True)
-
-    template_fill_wdm.heatmap(fig=fig, ax=ax2, index=0, add_cax=True)
     injection.data_res_arr.heatmap(fig=fig, ax=ax1, index=0)
+    template_fill_wdm.heatmap(fig=fig, ax=ax2, index=0, add_cax=True)
     py_wdm_lookup.heatmap(fig=fig, ax=ax3, index=0)
-    plt.show()
+    ax1.set_title("injection")
+    ax2.set_title("C lookup template")
+    ax3.set_title("Python lookup template")
+    plt.tight_layout()
+    plt.savefig("gb_lookup_test_heatmap.png", dpi=120)
     plt.close()
-    breakpoint()
+    print("Saved heatmap to gb_lookup_test_heatmap.png")
+
+    # Stop here unless the user opts into the MCMC stage. The MCMC below takes a
+    # long time; for plain inner-product verification we don't need it.
+    # if os.environ.get("RUN_MCMC", "0") != "1":
+    #     print("Verification complete. Set RUN_MCMC=1 to also run the MCMC stage.")
+    #     sys.exit(0)
+    exit()
     analysis_mcmc = AnalysisContainer(injection, sens_mat, signal_gen=gb_gen_wrap)
     
     ntemps = 10
