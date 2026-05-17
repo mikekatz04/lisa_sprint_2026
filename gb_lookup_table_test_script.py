@@ -81,7 +81,6 @@ class GBLookupWaveWrap:
         fdot_deriv_tdi = wave_tmp.tdi_phase_spl(np.tile(t_arr, (1, 3, 1)), derivative=2)[0] / (2 * np.pi)
         fdot_deriv_ref = wave_tmp.phase_ref_spl(t_arr[None, :], derivative=2)[0]  / (2 * np.pi)
         fdot_deriv = fdot_deriv_ref + fdot_deriv_tdi
-
         tdi_amp = wave_tmp.tdi_amp_spl(np.tile(t_arr, (1, 3, 1)))[0]
         tdi_phase = wave_tmp.tdi_phase_spl(np.tile(t_arr, (1, 3, 1)))[0]
         ref_phase = wave_tmp.phase_ref_spl(t_arr[None, :])[0]
@@ -110,7 +109,10 @@ class GBLookupWaveWrap:
         n_min = self.output_set.ind_min_t
         m_min = self.output_set.ind_min_f
 
-        _wdm_coeffs, _m_layers = wdm_lookup_table.get_wdm_coeffs(amp_t, phi_t, freq_t, fdot_t, n_arr_in, num_m_layers=2)
+        _wdm_coeffs, _m_layers = wdm_lookup_table.get_wdm_coeffs(
+            amp_t, phi_t, freq_t, fdot_t, n_arr_in,
+            num_m_layers=int(os.environ.get("NUM_M_LAYERS", 2)),
+        )
         wdm_coeffs = _wdm_coeffs.reshape(3, -1, _wdm_coeffs.shape[-1])
         m_layers = _m_layers.reshape(3, -1, _wdm_coeffs.shape[-1])
         n_layers = np.repeat(n_arr[:, :, None], m_layers.shape[-1], axis=-1)
@@ -142,7 +144,7 @@ if __name__ == "__main__":
     _Tobs = 1. * YRSID_SI
     # between half day and 3/4 day. Will be very close to half day
     # (Nf, Nt, wavelet_duration) = WDMSettings.adjust_to_even_bins(0.5 * 24 * 3600.0, 0.75 * 24 * 3600.0, dt, _Tobs)
-    Nt = 256
+    Nt = 256 * 10
     Nf = 1460
 
     wavelet_duration = Nf * dt
@@ -178,8 +180,8 @@ if __name__ == "__main__":
 
     num_bin = 1
     amp = np.full(num_bin, 8.0e-22)
-    f0 = np.full(num_bin, 3.0e-3)  # (ind + i / num) * wdm_settings.layer_df)
-    fdot = np.full(num_bin, 1e-16)
+    f0 = np.full(num_bin, 18.0e-3)  # (ind + i / num) * wdm_settings.layer_df)
+    fdot = np.full(num_bin, 1e-14)
     fddot = np.full(num_bin, 0.0)
     phi0 = np.full(num_bin, 2.09802430298)
     inc = np.full(num_bin, 0.23984234)
@@ -187,7 +189,7 @@ if __name__ == "__main__":
     # NEED TO ADD FRAME TRANSFORM FOR PSI IF WORKING IN ECLIPTIC
     psi = np.full(num_bin, 1.234019814)
     lam = np.full(num_bin, 4.09808143)
-    beta = np.full(num_bin, 1.1)
+    beta = np.full(num_bin, 0.04)
     params = np.array([amp, f0, fdot, fddot, phi0, inc, psi, lam, beta]).T
 
     N = data_inj.shape[-1]
@@ -202,8 +204,8 @@ if __name__ == "__main__":
     fd_set = FDSettings(N_fd, df, min_freq=min_freq, max_freq=max_freq, force_backend=backend)
 
     # shave edges?
-    min_time = 0 * wavelet_duration
-    max_time = (Nt - 0) * wavelet_duration
+    min_time = 20 * wavelet_duration
+    max_time = (Nt - 20) * wavelet_duration
 
     wdm_set = WDMSettings(Nf, Nt, dt, min_freq=min_freq, max_freq=max_freq, min_time=min_time, max_time=max_time)
     inj_tmp = gb_gen_inj(amp, f0, fdot, fddot, phi0, inc, psi, lam, beta, convert_to_ra_dec=False, return_spline=True)
@@ -245,17 +247,23 @@ if __name__ == "__main__":
         time_layers = wdm_set.Nt
         td_window = xp.asarray(signal.windows.tukey(wdm_set.Nf * time_layers, alpha=0.05))
         m_ref = int(3e-3 / wdm_set.layer_df)
-        norm_freq_single_layer, m_diffs, _ = WDMLookupTable.apply_eps_frequency(0.0005, wdm_set, m_ref=m_ref, num_layers_diff=5)
-            
+        EPS_FREQ        = float(os.environ.get("EPS_FREQ", 0.001))
+        NUM_LAYERS_DIFF = int(os.environ.get("NUM_LAYERS_DIFF", 5))
+        print(f"[step] table build with EPS_FREQ={EPS_FREQ}, NUM_LAYERS_DIFF={NUM_LAYERS_DIFF}", flush=True)
+        norm_freq_single_layer, m_diffs, _ = WDMLookupTable.apply_eps_frequency(
+            EPS_FREQ, wdm_set, m_ref=m_ref, num_layers_diff=NUM_LAYERS_DIFF
+        )
+
         fdot_vals = np.array([0.0])
-        # fdot_vals = WDMLookupTable.apply_eps_fdot(0.2, wdm_set, fdot_max_factor=1.0) 
+        # fdot_vals = WDMLookupTable.apply_eps_fdot(0.2, wdm_set, fdot_max_factor=1.0)
 
         nchannel = 3
         wdm_lookup_table = WDMLookupTable(wdm_set, nchannel, norm_freq_single_layer=norm_freq_single_layer, m_diffs=m_diffs, fdot_vals=fdot_vals, m_ref=m_ref, batch_size_gen=5, td_window=td_window, store_path=store_path)
 
     # this tests cubic spline accuracy for python setup
     # C setup currently does central differencing at the wdm grid
-    N_sparse = 2048
+    N_sparse = int(os.environ.get("N_SPARSE", 4096))
+    print(f"[step] N_sparse={N_sparse}", flush=True)
     t_tdi_sparse = xp.linspace(t_arr[0], t_arr[-1], N_sparse)
 
     gb_comps = GBWDMComputations(wdm_lookup_table, Tobs, t_ref, orbits=orbits, tdi_config=tdi_config, force_backend=backend)
@@ -285,17 +293,309 @@ if __name__ == "__main__":
     check_ll_2 = analysis.template_likelihood(template_fill_wdm)  # template_likelihood ignores psd likelihood by default
     check_ip_2 = analysis.template_inner_product(template_fill_wdm)
     check_ip_d_d = analysis.inner_product()
+    overlap = analysis.template_inner_product(template_fill_wdm, normalize=True)
+
+    # ---- swap-likelihood vs get-likelihood cross-check -------------------------
+    # Placed before the Python-side gb_gen_wrap() call so it runs regardless of
+    # whether the Python lookup path is healthy. Detailed description below in
+    # the comment block before the configuration setup.
+    _run_swap_ll_check = True
+    if _run_swap_ll_check:
+        # The injection f0 in `params` (18 mHz) sits far outside the WDM active
+        # band [ind_min_f, ind_max_f]*layer_df, so both get_ll and swap_ll would
+        # trivially return zero on it. Pick a test frequency in the middle of
+        # the active band so the kernel actually accumulates contributions.
+        layer_df = wdm_set.layer_df
+        m_lo, m_hi = wdm_set.ind_min_f, wdm_set.ind_max_f
+        m_mid_A = (m_lo + m_hi) // 2
+        m_mid_B = m_mid_A + 3  # 3-layer offset; still inside the band if it fits
+        if m_mid_B > m_hi:
+            m_mid_B = m_hi
+        f0_A = m_mid_A * layer_df
+        f0_B = m_mid_B * layer_df
+
+        params_A = params.copy()
+        params_B = params.copy()
+        params_A[:, 1] = f0_A
+        params_B[:, 1] = f0_B
+        print(f"[swap_ll test] active band layers=[{m_lo},{m_hi}], layer_df={layer_df:.6e}")
+        print(f"[swap_ll test] sourceA f0={f0_A:.6e} (layer {m_mid_A}), sourceB f0={f0_B:.6e} (layer {m_mid_B})")
+
+        _ = gb_comps.get_ll_wdm(params_A, wdm_holder, data_index=None, noise_index=None, convert_to_ra_dec=False)
+        d_h_A_ref = float(gb_comps.d_h_out[0])
+        h_h_A_ref = float(gb_comps.h_h_out[0])
+
+        _ = gb_comps.get_ll_wdm(params_B, wdm_holder, data_index=None, noise_index=None, convert_to_ra_dec=False)
+        d_h_B_ref = float(gb_comps.d_h_out[0])
+        h_h_B_ref = float(gb_comps.h_h_out[0])
+
+        like_A_ref = -0.5 * (gb_comps.d_d + h_h_A_ref - 2 * d_h_A_ref)
+        like_B_ref = -0.5 * (gb_comps.d_d + h_h_B_ref - 2 * d_h_B_ref)
+
+        params_add_in    = np.stack([params_A[0], params_A[0], params_B[0]], axis=0)
+        params_remove_in = np.stack([params_A[0], params_B[0], params_A[0]], axis=0)
+
+        (
+            like_add,
+            like_remove,
+            d_h_add,
+            d_h_remove,
+            add_add,
+            remove_remove,
+            add_remove,
+        ) = gb_comps.get_swap_ll_wdm(
+            params_add_in, params_remove_in, wdm_holder,
+            data_index=None, noise_index=None, convert_to_ra_dec=False,
+        )
+
+        def _xp_to_np(a):
+            return a.get() if hasattr(a, "get") else np.asarray(a)
+
+        d_h_add        = _xp_to_np(d_h_add)
+        d_h_remove     = _xp_to_np(d_h_remove)
+        add_add        = _xp_to_np(add_add)
+        remove_remove  = _xp_to_np(remove_remove)
+        add_remove     = _xp_to_np(add_remove)
+        like_add       = _xp_to_np(like_add)
+        like_remove    = _xp_to_np(like_remove)
+
+        def _rel(a, b):
+            denom = max(abs(b), 1e-300)
+            return abs(a - b) / denom
+
+        # bin 0: same source, all outputs == get_ll(sourceA)
+        bin0_rel = max(
+            _rel(d_h_add[0],       d_h_A_ref),
+            _rel(d_h_remove[0],    d_h_A_ref),
+            _rel(add_add[0],       h_h_A_ref),
+            _rel(remove_remove[0], h_h_A_ref),
+            _rel(add_remove[0],    h_h_A_ref),
+            _rel(like_add[0],      like_A_ref),
+            _rel(like_remove[0],   like_A_ref),
+        )
+
+        # bin 1: add=A, remove=B
+        bin1_rel = max(
+            _rel(d_h_add[1],       d_h_A_ref),
+            _rel(d_h_remove[1],    d_h_B_ref),
+            _rel(add_add[1],       h_h_A_ref),
+            _rel(remove_remove[1], h_h_B_ref),
+            _rel(like_add[1],      like_A_ref),
+            _rel(like_remove[1],   like_B_ref),
+        )
+
+        # bin 2: add=B, remove=A. Must mirror bin 1 after swap.
+        bin2_rel = max(
+            _rel(d_h_add[2],       d_h_B_ref),
+            _rel(d_h_remove[2],    d_h_A_ref),
+            _rel(add_add[2],       h_h_B_ref),
+            _rel(remove_remove[2], h_h_A_ref),
+            _rel(like_add[2],      like_B_ref),
+            _rel(like_remove[2],   like_A_ref),
+        )
+
+        # swap symmetry: cross term must be the same whichever side is "add"
+        sym_rel = _rel(add_remove[1], add_remove[2])
+
+        # Cauchy-Schwarz on each bin: |<h_a|h_r>|^2 <= <h_a|h_a> * <h_r|h_r>
+        cs_eps = 1e-9
+        cs_bin = []
+        for k in range(3):
+            lhs = add_remove[k] ** 2
+            rhs = (1.0 + cs_eps) * add_add[k] * remove_remove[k]
+            cs_bin.append((lhs, rhs, lhs <= rhs))
+
+        print(f"==== swap_ll vs get_ll cross-check ====")
+        print(f"  sourceA: d_h = {d_h_A_ref:+.8e}   h_h = {h_h_A_ref:+.8e}   like = {like_A_ref:+.8e}")
+        print(f"  sourceB: d_h = {d_h_B_ref:+.8e}   h_h = {h_h_B_ref:+.8e}   like = {like_B_ref:+.8e}")
+        print(f"  bin0 (A,A)  rel_max = {bin0_rel:.3e}")
+        print(f"             d_h_add={d_h_add[0]:+.6e}  d_h_remove={d_h_remove[0]:+.6e}")
+        print(f"             add_add={add_add[0]:+.6e}  remove_remove={remove_remove[0]:+.6e}  add_remove={add_remove[0]:+.6e}")
+        print(f"  bin1 (A,B)  rel_max = {bin1_rel:.3e}")
+        print(f"             d_h_add={d_h_add[1]:+.6e}  d_h_remove={d_h_remove[1]:+.6e}")
+        print(f"             add_add={add_add[1]:+.6e}  remove_remove={remove_remove[1]:+.6e}  add_remove={add_remove[1]:+.6e}")
+        print(f"  bin2 (B,A)  rel_max = {bin2_rel:.3e}")
+        print(f"             d_h_add={d_h_add[2]:+.6e}  d_h_remove={d_h_remove[2]:+.6e}")
+        print(f"             add_add={add_add[2]:+.6e}  remove_remove={remove_remove[2]:+.6e}  add_remove={add_remove[2]:+.6e}")
+        print(f"  swap symmetry add_remove(A,B) vs add_remove(B,A)  rel = {sym_rel:.3e}")
+        for k, (lhs, rhs, ok) in enumerate(cs_bin):
+            status = "ok" if ok else "FAIL"
+            print(f"  Cauchy-Schwarz bin{k}: |add_remove|^2={lhs:+.6e}  <h_a|h_a><h_r|h_r>={rhs:+.6e}  [{status}]")
+
+        swap_tol = float(os.environ.get("SWAP_LL_TOL", 1e-10))
+        sym_tol  = float(os.environ.get("SWAP_LL_SYM_TOL", 1e-9))
+        worst = max(bin0_rel, bin1_rel, bin2_rel)
+        cs_ok = all(c[2] for c in cs_bin)
+        if worst > swap_tol:
+            print(f"[FAIL] swap_ll <-> get_ll disagree above tol={swap_tol}; worst rel = {worst:.3e}")
+        elif sym_rel > sym_tol:
+            print(f"[FAIL] swap-symmetry violated: add_remove(A,B) != add_remove(B,A) (rel = {sym_rel:.3e}, tol = {sym_tol})")
+        elif not cs_ok:
+            print(f"[FAIL] Cauchy-Schwarz violated on at least one bin")
+        else:
+            print(f"[ok] swap_ll matches get_ll on each per-template piece (worst rel = {worst:.3e}, tol = {swap_tol}),")
+            print(f"     cross term is symmetric under add↔remove (rel = {sym_rel:.3e}, tol = {sym_tol}),")
+            print(f"     and obeys Cauchy-Schwarz on every bin.\n")
+
+
+    # ---- chain-rule gradient cross-check --------------------------------------
+    # Same setup as the swap_ll block above: source A and source B inside the
+    # active WDM band.  We call the new C/CUDA gradient kernels
+    #
+    #     gb_comps.get_ll_grad_wdm(...)         (shape (num_bin, 9))
+    #     gb_comps.get_swap_ll_grad_wdm(...)    (grad_add, grad_remove)
+    #
+    # which compute the per-binary parameter gradient of L = -1/2 (d_d + h_h - 2 d_h)
+    # (and of the swap log-likelihood ratio) via per-pixel central differences on
+    # top of the same fast_wdm_inner / wdm_lookup pipeline used by get_ll / swap_ll.
+    #
+    # As a reference we run a Python-side finite difference of the *same*
+    # likelihood values (get_ll_wdm / get_swap_ll_wdm) with the *same* per-param
+    # step sizes ``param_eps`` -- so the two methods are computing the same
+    # mathematical object, just at different granularity (per-pixel vs per-run).
+    # They must agree to round-off.
+    _run_grad_check = bool(int(os.environ.get("RUN_GRAD_CHECK", "1")))
+    if _run_grad_check:
+        # Same per-parameter FD step that the C kernel will use by default
+        # (see GBWDMComputations._DEFAULT_PARAM_EPS).  Keep them consistent so
+        # the two FDs cancel exactly.
+        param_eps_default = np.array(GBWDMComputations._DEFAULT_PARAM_EPS, dtype=np.float64)
+        nparams = params_A.shape[1]
+        assert param_eps_default.shape[0] == nparams
+
+        def _xp_to_np_local(a):
+            return a.get() if hasattr(a, "get") else np.asarray(a)
+
+        # --- get_ll gradient: source A
+        grad_C = gb_comps.get_ll_grad_wdm(
+            params_A, wdm_holder,
+            param_eps=param_eps_default,
+            data_index=None, noise_index=None, convert_to_ra_dec=False,
+        )
+        grad_C = _xp_to_np_local(grad_C)[0]   # (nparams,)
+
+        def _ll_at(p_arr):
+            """Recompute L = -0.5 (d_d + h_h - 2 d_h) at the supplied params."""
+            _ = gb_comps.get_ll_wdm(
+                p_arr, wdm_holder,
+                data_index=None, noise_index=None, convert_to_ra_dec=False,
+            )
+            d_h = float(_xp_to_np_local(gb_comps.d_h_out)[0])
+            h_h = float(_xp_to_np_local(gb_comps.h_h_out)[0])
+            return -0.5 * (gb_comps.d_d + h_h - 2 * d_h)
+
+        grad_fd = np.zeros(nparams, dtype=np.float64)
+        for k in range(nparams):
+            eps_k = param_eps_default[k]
+            if eps_k <= 0.0:
+                continue
+            pp = params_A.copy(); pp[:, k] = pp[:, k] + eps_k
+            pm = params_A.copy(); pm[:, k] = pm[:, k] - eps_k
+            grad_fd[k] = (_ll_at(pp) - _ll_at(pm)) / (2.0 * eps_k)
+
+        param_names = ("amp", "f0", "fdot", "fddot", "phi0", "iota", "psi", "lam", "beta")
+        print(f"==== get_ll gradient (C/CUDA chain rule) vs Python FD of get_ll ====")
+        worst_grad = 0.0
+        for k in range(nparams):
+            denom = max(abs(grad_fd[k]), 1e-300)
+            rel = abs(grad_C[k] - grad_fd[k]) / denom
+            worst_grad = max(worst_grad, rel)
+            print(f"  {param_names[k]:>5s}  C={grad_C[k]:+.8e}  FD={grad_fd[k]:+.8e}  rel={rel:.2e}")
+        grad_tol = float(os.environ.get("GRAD_LL_TOL", 1e-8))
+        status = "ok" if worst_grad < grad_tol else "FAIL"
+        print(f"  worst rel = {worst_grad:.3e}   tol = {grad_tol}   [{status}]\n")
+
+        # --- swap_ll gradient: (add, remove) on the three bins from above
+        grad_add_C, grad_remove_C = gb_comps.get_swap_ll_grad_wdm(
+            params_add_in, params_remove_in, wdm_holder,
+            param_eps_add=param_eps_default,
+            param_eps_remove=param_eps_default,
+            data_index=None, noise_index=None, convert_to_ra_dec=False,
+        )
+        grad_add_C = _xp_to_np_local(grad_add_C)
+        grad_remove_C = _xp_to_np_local(grad_remove_C)
+
+        def _ll_diff_at(p_add, p_remove):
+            """ll_diff = L(after swap) - L(before swap) at supplied params.
+
+            Mirrors gb_wdm_swap_ll_kernel: returns -1/2 (-2 d_h_add + 2 d_h_remove
+            - 2 add_remove + add_add + remove_remove). Same convention used by
+            the C swap_ll_grad kernel."""
+            (
+                _like_add, _like_remove,
+                d_h_add_v, d_h_remove_v,
+                add_add_v, remove_remove_v, add_remove_v,
+            ) = gb_comps.get_swap_ll_wdm(
+                p_add, p_remove, wdm_holder,
+                data_index=None, noise_index=None, convert_to_ra_dec=False,
+            )
+            d_h_a = _xp_to_np_local(d_h_add_v)
+            d_h_r = _xp_to_np_local(d_h_remove_v)
+            aa    = _xp_to_np_local(add_add_v)
+            rr    = _xp_to_np_local(remove_remove_v)
+            ar    = _xp_to_np_local(add_remove_v)
+            return -0.5 * (-2.0 * d_h_a + 2.0 * d_h_r - 2.0 * ar + aa + rr)
+
+        # FD w.r.t. add params
+        grad_add_fd = np.zeros_like(grad_add_C)
+        for k in range(nparams):
+            eps_k = param_eps_default[k]
+            if eps_k <= 0.0:
+                continue
+            pa_p = params_add_in.copy(); pa_p[:, k] = pa_p[:, k] + eps_k
+            pa_m = params_add_in.copy(); pa_m[:, k] = pa_m[:, k] - eps_k
+            ll_p = _ll_diff_at(pa_p, params_remove_in)
+            ll_m = _ll_diff_at(pa_m, params_remove_in)
+            grad_add_fd[:, k] = (ll_p - ll_m) / (2.0 * eps_k)
+
+        # FD w.r.t. remove params
+        grad_remove_fd = np.zeros_like(grad_remove_C)
+        for k in range(nparams):
+            eps_k = param_eps_default[k]
+            if eps_k <= 0.0:
+                continue
+            pr_p = params_remove_in.copy(); pr_p[:, k] = pr_p[:, k] + eps_k
+            pr_m = params_remove_in.copy(); pr_m[:, k] = pr_m[:, k] - eps_k
+            ll_p = _ll_diff_at(params_add_in, pr_p)
+            ll_m = _ll_diff_at(params_add_in, pr_m)
+            grad_remove_fd[:, k] = (ll_p - ll_m) / (2.0 * eps_k)
+
+        print(f"==== swap_ll gradient (C/CUDA chain rule) vs Python FD of swap_ll ====")
+        worst_swap_grad = 0.0
+        for which, gC, gFD in (("add", grad_add_C, grad_add_fd),
+                                ("remove", grad_remove_C, grad_remove_fd)):
+            print(f"  >>> theta_{which}")
+            for bin_idx in range(gC.shape[0]):
+                for k in range(nparams):
+                    denom = max(abs(gFD[bin_idx, k]), 1e-300)
+                    rel = abs(gC[bin_idx, k] - gFD[bin_idx, k]) / denom
+                    worst_swap_grad = max(worst_swap_grad, rel)
+                # only print the bin's worst-row to keep the log readable;
+                # uncomment the per-k print above if you need full detail.
+                row_rel = np.max(np.abs(gC[bin_idx] - gFD[bin_idx])
+                                 / np.maximum(np.abs(gFD[bin_idx]), 1e-300))
+                print(f"    bin{bin_idx}  worst rel = {row_rel:.3e}")
+                # full per-parameter dump for inspection (concise)
+                for k in range(nparams):
+                    print(f"      {param_names[k]:>5s}  C={gC[bin_idx,k]:+.6e}  FD={gFD[bin_idx,k]:+.6e}")
+        status = "ok" if worst_swap_grad < grad_tol else "FAIL"
+        print(f"  swap-gradient worst rel = {worst_swap_grad:.3e}   tol = {grad_tol}   [{status}]\n")
 
     # The wrap's __call__ takes the 9 scalar params as *args (see GBLookupWaveWrap above).
     py_wdm_lookup = gb_gen_wrap(*params[0])
     tmp_val1 = analysis.template_inner_product(py_wdm_lookup)
     tmp_val2 = analysis.calculate_signal_inner_product(*params[0])
+    tmp_val3 = analysis.calculate_signal_likelihood(*params[0], source_only=True)
+    overlap_py = analysis.template_inner_product(py_wdm_lookup, normalize=True)
 
     print(f"\n[result] base inner_product <d|d>            = {check_ip_d_d}")
     print(f"[result] template_inner_product (C lookup)     = {check_ip_2}")
     print(f"[result] template_inner_product (py lookup)    = {tmp_val1}")
     print(f"[result] calculate_signal_inner_product        = {tmp_val2}")
     print(f"[result] template_likelihood (C lookup)        = {check_ll_2}\n")
+    print(f"[result] template_likelihood (py lookup)        = {tmp_val3}\n")
+    print(f"[result] Noise-weighted mismatch (C lookup)        = {1.0 - overlap}\n")
+    print(f"[result] Noise-weighted mismatch (py lookup)        = {1.0 - overlap_py}\n")
 
     # Per-channel AET cross-check: convert XYZ → AET in WDM space and compare
     # each orthogonal AET channel separately (they decouple under AET1Sens).
