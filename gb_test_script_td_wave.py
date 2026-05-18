@@ -110,8 +110,8 @@ if __name__ == "__main__":
 
     num_bin = 1
     amp = np.full(num_bin, 8.0e-23)
-    f0 = np.full(num_bin, 20.0e-3)  # (ind + i / num) * wdm_settings.layer_df)
-    fdot = np.full(num_bin, 1e-14)
+    f0 = np.full(num_bin, 2.0e-3)  # (ind + i / num) * wdm_settings.layer_df)
+    fdot = np.full(num_bin, 1e-17)
     fddot = np.full(num_bin, 0.0)
     phi0 = np.full(num_bin, 2.09802430298)
     inc = np.full(num_bin, 0.23984234)
@@ -179,7 +179,7 @@ if __name__ == "__main__":
 
     print(f"Log Likelihood:", check_ll, "Mismatch (noise-weighted):", mismatch, "Overlap (noise-weighted):", overlap, "SNR (observed, optimal):", check_snr)
     ## mcmc functions
-
+    breakpoint()
     analysis_mcmc = AnalysisContainer(injection, sens_mat, signal_gen=gb_gen_wrap)
 
     ntemps = 2

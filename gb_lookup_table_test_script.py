@@ -199,8 +199,8 @@ if __name__ == "__main__":
     N_fd = len(freqs)
     window = xp.asarray(signal.windows.tukey(N, alpha=0.05))
 
-    min_freq = 0.0029493407356002777  # 255 * wdm_set.layer_df
-    max_freq = 0.00306500115660421  # 265 * wdm_set.layer_df
+    min_freq = 0.0001  # 0.0029493407356002777  # 255 * wdm_set.layer_df
+    max_freq = 35.0e-3 # 0.00306500115660421  # 265 * wdm_set.layer_df
     fd_set = FDSettings(N_fd, df, min_freq=min_freq, max_freq=max_freq, force_backend=backend)
 
     # shave edges?
@@ -229,7 +229,7 @@ if __name__ == "__main__":
     
     ## mcmc functions
 
-    store_path = "wdm_lookup_new_all_time_layers_1.h5"
+    store_path = "wdm_lookup_new_all_time_layers_3.h5"
         
     ## lookup table setup
     if os.path.exists(store_path):
@@ -294,6 +294,70 @@ if __name__ == "__main__":
     check_ip_2 = analysis.template_inner_product(template_fill_wdm)
     check_ip_d_d = analysis.inner_product()
     overlap = analysis.template_inner_product(template_fill_wdm, normalize=True)
+
+    # ---- spline-path smoke check vs direct path -------------------------------
+    # Set RUN_SPLINE_CHECK=1 to run the spline-flavored fill/get_ll/swap_ll/grad
+    # kernels and report max-rel-diff vs the direct path on the same source.
+    # Coarse density via env COARSE_PTS_PER_YEAR (default 256).
+    if os.environ.get("RUN_SPLINE_CHECK", "0") == "1":
+        coarse_pts_per_year = int(os.environ.get("COARSE_PTS_PER_YEAR", 256))
+        print(f"\n[spline check] coarse_pts_per_year={coarse_pts_per_year}")
+
+        # Use an in-band f0 so the kernels actually accumulate.
+        m_lo_chk, m_hi_chk = wdm_set.ind_min_f, wdm_set.ind_max_f
+        m_mid_chk = (m_lo_chk + m_hi_chk) // 2
+        params_chk = params.copy()
+        params_chk[:, 1] = m_mid_chk * wdm_set.layer_df
+
+        def _rel_max(a, b):
+            a = np.asarray(a)
+            b = np.asarray(b)
+            mask = np.abs(b) > 0
+            if not np.any(mask):
+                return 0.0
+            return float(np.max(np.abs(a[mask] - b[mask]) / np.abs(b[mask])))
+
+        tpl_d = xp.zeros(3 * np.prod(wdm_set.basis_shape_active), dtype=float)
+        tpl_s = xp.zeros_like(tpl_d)
+        gb_comps.fill_global_wdm(tpl_d, params_chk, wdm_holder, data_index=None, convert_to_ra_dec=False)
+        gb_comps.fill_global_wdm(tpl_s, params_chk, wdm_holder, data_index=None, convert_to_ra_dec=False,
+                                 use_spline=True, coarse_pts_per_year=coarse_pts_per_year)
+        nz = np.abs(tpl_d) > 0
+        if np.any(nz):
+            rel = np.abs(tpl_s[nz] - tpl_d[nz]) / np.abs(tpl_d[nz])
+            print(f"[spline check] fill_global: nz pixels={int(nz.sum())}, max rel={float(rel.max()):.3e}, median rel={float(np.median(rel)):.3e}")
+        else:
+            print("[spline check] fill_global: direct template all zero")
+
+        _ = gb_comps.get_ll_wdm(params_chk, wdm_holder, convert_to_ra_dec=False)
+        d_h_d, h_h_d = float(gb_comps.d_h_out[0]), float(gb_comps.h_h_out[0])
+        _ = gb_comps.get_ll_wdm(params_chk, wdm_holder, convert_to_ra_dec=False,
+                                use_spline=True, coarse_pts_per_year=coarse_pts_per_year)
+        d_h_s, h_h_s = float(gb_comps.d_h_out[0]), float(gb_comps.h_h_out[0])
+        print(f"[spline check] get_ll: d_h rel={abs(d_h_s - d_h_d)/max(abs(d_h_d),1e-300):.3e}, h_h rel={abs(h_h_s - h_h_d)/max(abs(h_h_d),1e-300):.3e}")
+
+        pA = params_chk.copy()
+        pB = params_chk.copy()
+        m_off = min(m_mid_chk + 3, m_hi_chk)
+        pB[:, 1] = m_off * wdm_set.layer_df
+        out_d = gb_comps.get_swap_ll_wdm(pA, pB, wdm_holder, convert_to_ra_dec=False)
+        out_s = gb_comps.get_swap_ll_wdm(pA, pB, wdm_holder, convert_to_ra_dec=False,
+                                         use_spline=True, coarse_pts_per_year=coarse_pts_per_year)
+        for nm, vd, vs in zip(
+            ["like_add", "like_remove", "d_h_add", "d_h_remove", "add_add", "remove_remove", "add_remove"],
+            out_d, out_s,
+        ):
+            vd = float(np.asarray(vd)[0]); vs = float(np.asarray(vs)[0])
+            print(f"[spline check] swap_ll {nm:14s} rel={abs(vs - vd)/max(abs(vd),1e-300):.3e}")
+
+        grad_d = np.asarray(gb_comps.get_ll_grad_wdm(params_chk, wdm_holder, convert_to_ra_dec=False))
+        grad_s = np.asarray(gb_comps.get_ll_grad_wdm(params_chk, wdm_holder, convert_to_ra_dec=False,
+                                                      use_spline=True, coarse_pts_per_year=coarse_pts_per_year))
+        rels = np.abs(grad_s[0] - grad_d[0]) / np.maximum(np.abs(grad_d[0]), 1e-300)
+        print(f"[spline check] get_ll_grad direct = {grad_d[0]}")
+        print(f"[spline check] get_ll_grad spline = {grad_s[0]}")
+        print(f"[spline check] get_ll_grad per-param rel = {rels}")
+        print(f"[spline check] get_ll_grad max rel = {float(rels.max()):.3e}")
 
     # ---- swap-likelihood vs get-likelihood cross-check -------------------------
     # Placed before the Python-side gb_gen_wrap() call so it runs regardless of
