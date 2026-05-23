@@ -99,9 +99,54 @@ class GBLookupWaveWrap:
         # ])
 
         # pi/2 PHASE SHIFT !!!!!!!!!!!!!!!!!!!!!!!!!
-        phi_t = ((tdi_phase + ref_phase) + np.pi / 2.).flatten().copy() #  (np.angle(wave_tmp.X).squeeze())# [:-2] # % (2 * np.pi)
+        # PHI_OFFSET env adds a constant (in rad) to the carrier phase passed
+        # to the lookup — for diagnosing whether the residual at f_frac=0.5
+        # is a constant phase-convention mismatch between build and eval.
+        _phi_offset = float(os.environ.get("PHI_OFFSET", "0.0"))
+        phi_t = ((tdi_phase + ref_phase) + np.pi / 2. + _phi_offset).flatten().copy()
+        np.save("f_deriv", f_deriv)
         freq_t = f_deriv.flatten().copy()
-        fdot_t = np.full_like(freq_t, 0.0)  # fdot_deriv.flatten().copy()
+        # FREEZE_FREQ=1 replaces the per-pixel Doppler-shifted instantaneous
+        # frequency with the source's t=t_ref carrier frequency f0 (constant).
+        # Diagnostic: if mm at f_frac=0.5 stays ~2e-4 with FREEZE_FREQ=1, the
+        # residual is NOT from how Doppler-shifted f_t routes pixels to lookup
+        # cells; if it gets worse, the lookup IS tracking Doppler properly.
+        if os.environ.get("FREEZE_FREQ", "0") == "1":
+            _f0_const = float(params[0, 1])  # f0 from input params
+            freq_t = np.full_like(freq_t, _f0_const)
+        # USE_FDOT_DERIV=1 passes the actual instantaneous fdot per pixel
+        # through to the lookup. Default 0 keeps the previous fdot_t=0
+        # behaviour so the fdot=0-only path stays exercised.
+        # SLOPE_FDOT=1 (with WAVELET_EXTENT=K, default 3) replaces the
+        # instantaneous fdot with a finite-difference slope over the
+        # wavelet's effective time support:
+        #   fdot_n = ( f(t_n + K*layer_dt) − f(t_n − K*layer_dt) ) / (2·K·layer_dt)
+        # This better matches what the wavelet integrates (its support is
+        # ~4-6 layer_dt, not a single pixel) and may capture frequency
+        # drift over the wavelet window more accurately than the
+        # instantaneous derivative.
+        if os.environ.get("SLOPE_FDOT", "0") == "1":
+            _ext = float(os.environ.get("WAVELET_EXTENT", "3"))
+            _dt_step = _ext * self.output_set.layer_dt
+            t_lo = t_arr - _dt_step
+            t_hi = t_arr + _dt_step
+            f_lo_tdi = wave_tmp.tdi_phase_spl(np.tile(t_lo, (1, 3, 1)), derivative=1)[0] / (2 * np.pi)
+            f_lo_ref = wave_tmp.phase_ref_spl(t_lo[None, :], derivative=1)[0] / (2 * np.pi)
+            f_hi_tdi = wave_tmp.tdi_phase_spl(np.tile(t_hi, (1, 3, 1)), derivative=1)[0] / (2 * np.pi)
+            f_hi_ref = wave_tmp.phase_ref_spl(t_hi[None, :], derivative=1)[0] / (2 * np.pi)
+            f_lo = f_lo_ref + f_lo_tdi
+            f_hi = f_hi_ref + f_hi_tdi
+            fdot_slope = (f_hi - f_lo) / (2.0 * _dt_step)
+            # Print summary so the per-run mode is obvious.
+            print(f"  [slope_fdot] extent={_ext} layer_dt ({_dt_step:.3e} s);"
+                  f" max|fdot_slope|={np.abs(fdot_slope).max():.3e}"
+                  f" vs max|fdot_inst|={np.abs(fdot_deriv).max():.3e}",
+                  flush=True)
+            fdot_t = fdot_slope.flatten().copy()
+        elif os.environ.get("USE_FDOT_DERIV", "0") == "1":
+            fdot_t = fdot_deriv.flatten().copy()
+        else:
+            fdot_t = np.full_like(freq_t, 0.0)
         amp_t = tdi_amp.flatten().copy()
 
         n_arr = np.tile(xp.arange(self.output_set.Nt)[self.output_set.active_slice_t], (3, 1))
@@ -140,12 +185,27 @@ if __name__ == "__main__":
     xp = np if backend == "cpu" else cp
 
     orbits = ESAOrbits(force_backend=backend)
+    # ORBIT_DT (s) or ORBIT_LINEAR=1 to configure orbits more densely.
+    # Default base orbits use dt_base ~ 1.87 days with 5th-order interp.
+    _orbit_dt = os.environ.get("ORBIT_DT", "")
+    _orbit_linear = os.environ.get("ORBIT_LINEAR", "0") == "1"
+    if _orbit_linear:
+        orbits.configure(linear_interp_setup=True)
+        print(f"[step] ORBITS: linear_interp_setup=True (dense linear interp)", flush=True)
+    elif _orbit_dt.strip():
+        orbits.configure(dt=float(_orbit_dt))
+        print(f"[step] ORBITS: configured at dt={_orbit_dt}s with cubic spline", flush=True)
+    else:
+        print(f"[step] ORBITS: base (dt~1.87d, 5th-order interp)", flush=True)
     dt = 10.0  # mojito
     _Tobs = 1. * YRSID_SI
     # between half day and 3/4 day. Will be very close to half day
     # (Nf, Nt, wavelet_duration) = WDMSettings.adjust_to_even_bins(0.5 * 24 * 3600.0, 0.75 * 24 * 3600.0, dt, _Tobs)
-    Nt = 256 * 10
-    Nf = 1460
+    # NF, NT env overrides — change wavelet aspect at constant total signal
+    # length (Nf*Nt) to test if dK/df numerical precision is the residual
+    # source. Defaults preserve current 1460×2560 setup.
+    Nf = int(os.environ.get("NF", 1460))
+    Nt = int(os.environ.get("NT", 256 * 10))
 
     wavelet_duration = Nf * dt
     Tobs = Nt * wavelet_duration
@@ -178,59 +238,49 @@ if __name__ == "__main__":
         **gb_tdi_kwargs
     )
 
-    num_bin = 1
-    amp = np.full(num_bin, 8.0e-22)
-    f0 = np.full(num_bin, 18.0e-3)  # (ind + i / num) * wdm_settings.layer_df)
-    fdot = np.full(num_bin, 1e-14)
-    fddot = np.full(num_bin, 0.0)
-    phi0 = np.full(num_bin, 2.09802430298)
-    inc = np.full(num_bin, 0.23984234)
-
-    # NEED TO ADD FRAME TRANSFORM FOR PSI IF WORKING IN ECLIPTIC
-    psi = np.full(num_bin, 1.234019814)
-    lam = np.full(num_bin, 4.09808143)
-    beta = np.full(num_bin, 0.04)
-    params = np.array([amp, f0, fdot, fddot, phi0, inc, psi, lam, beta]).T
-
     N = data_inj.shape[-1]
     td_set = TDSettings(N, dt, force_backend=backend)
     freqs = np.fft.rfftfreq(N, dt)
     df = freqs[1] - freqs[0]
     N_fd = len(freqs)
-    window = xp.asarray(signal.windows.tukey(N, alpha=0.05))
+    # TUKEY_ALPHA env var sets a Tukey window on the injection TD->WDM
+    # transform (and on the lookup build's td_window when build_kind allows
+    # it). alpha=0.5 tapers 25% on each end. Default 0 (= unity window).
+    _tukey_alpha = float(os.environ.get("TUKEY_ALPHA", "0.0"))
+    if _tukey_alpha > 0:
+        window = xp.asarray(signal.windows.tukey(N, alpha=_tukey_alpha))
+    else:
+        window = xp.ones(N)
 
     min_freq = 0.0001  # 0.0029493407356002777  # 255 * wdm_set.layer_df
     max_freq = 35.0e-3 # 0.00306500115660421  # 265 * wdm_set.layer_df
     fd_set = FDSettings(N_fd, df, min_freq=min_freq, max_freq=max_freq, force_backend=backend)
 
     # shave edges?
-    min_time = 20 * wavelet_duration
-    max_time = (Nt - 20) * wavelet_duration
+    _EDGE_CUT = int(os.environ.get("EDGE_CUT", "20"))
+    min_time = _EDGE_CUT * wavelet_duration
+    max_time = (Nt - _EDGE_CUT) * wavelet_duration
 
     wdm_set = WDMSettings(Nf, Nt, dt, min_freq=min_freq, max_freq=max_freq, min_time=min_time, max_time=max_time)
-    inj_tmp = gb_gen_inj(amp, f0, fdot, fddot, phi0, inc, psi, lam, beta, convert_to_ra_dec=False, return_spline=True)
-    data_inj[:] = inj_tmp.eval_tdi(t_arr)
-
-    output_set = wdm_set
-
-    if output_set != wdm_set:
-        raise ValueError("This script requires WDM for the output_set.")
     
-    # plot
-    # plt.rcParams['text.usetex'] = False
-    # template_sparse.heatmap()
-    # plt.show()
-    # plt.close()
+    # Plan A (n_ref_only) build path. WDM_BUILD_KIND env var picks the
+    # build kind; FDOT_EPS controls the fdot grid density (0 → no fdot).
+    BUILD_KIND     = os.environ.get("WDM_BUILD_KIND", "n_ref_only")
+    EPS_FREQ       = float(os.environ.get("EPS_FREQ", 0.001))
+    NUM_LAYERS_DIFF = int(os.environ.get("NUM_LAYERS_DIFF", 5))
+    FDOT_EPS       = float(os.environ.get("FDOT_EPS", "0.0"))
+    FDOT_MAX_FACTOR = float(os.environ.get("FDOT_MAX_FACTOR", "2.0"))
+    # Auto-named store so fdot=0 and fdot grids don't clobber each other.
+    _default_store = (
+        f"wdm_lookup_{BUILD_KIND}"
+        f"_efreq{EPS_FREQ:.3f}_nld{NUM_LAYERS_DIFF}"
+        f"_fdot{FDOT_EPS:.2f}x{FDOT_MAX_FACTOR:.1f}.h5"
+    )
+    store_path = os.environ.get("WDM_STORE_PATH", _default_store)
+    print(f"[step] build_kind={BUILD_KIND}  store_path={store_path}", flush=True)
+    print(f"[step] EPS_FREQ={EPS_FREQ}  NUM_LAYERS_DIFF={NUM_LAYERS_DIFF}  "
+          f"FDOT_EPS={FDOT_EPS}  FDOT_MAX_FACTOR={FDOT_MAX_FACTOR}", flush=True)
 
-    data_inj_all = TDSignal(data_inj, settings=td_set).transform(output_set, window=window)
-    injection = DataResidualArray(data_inj_all)
-    sens_mat = XYZ2SensitivityMatrix(injection.data_res_arr.settings, model="scirdv1")
-
-    
-    ## mcmc functions
-
-    store_path = "wdm_lookup_new_all_time_layers_3.h5"
-        
     ## lookup table setup
     if os.path.exists(store_path):
         wdm_lookup_table = WDMLookupTable.from_file(store_path, force_backend=backend)
@@ -238,63 +288,300 @@ if __name__ == "__main__":
         if not _wdm_settings.eq_without_inds(wdm_set):
             raise ValueError("WDM Settings are not equivalent to lookup table. Either adjust to lookup table settings or regenerate the table.")
 
-        # Nt = wdm_settings.Nt
-        # Nf = wdm_settings.Nf
-        # N = wdm_settings.N
-        # Tobs = wdm_settings.Tobs
-
     else:
-        time_layers = wdm_set.Nt
-        td_window = xp.asarray(signal.windows.tukey(wdm_set.Nf * time_layers, alpha=0.05))
+        # Plan A (n_ref_only) requires no windowing on the carrier (the build
+        # asserts td_window=None). per_n accepts a non-trivial td_window —
+        # if TUKEY_ALPHA > 0 we apply the same Tukey to the build's carrier
+        # source so both the injection's WDM transform and the lookup table
+        # build share the same windowing convention (suppresses FD leakage
+        # that could differentially affect mid-band wavelet coefficients).
+        if BUILD_KIND == "per_n" and _tukey_alpha > 0:
+            td_window = window  # reuse the inj-side Tukey
+            print(f"[step] using Tukey alpha={_tukey_alpha} for BOTH inj and per_n build td_window", flush=True)
+        else:
+            td_window = None
         m_ref = int(3e-3 / wdm_set.layer_df)
-        EPS_FREQ        = float(os.environ.get("EPS_FREQ", 0.001))
-        NUM_LAYERS_DIFF = int(os.environ.get("NUM_LAYERS_DIFF", 5))
-        print(f"[step] table build with EPS_FREQ={EPS_FREQ}, NUM_LAYERS_DIFF={NUM_LAYERS_DIFF}", flush=True)
         norm_freq_single_layer, m_diffs, _ = WDMLookupTable.apply_eps_frequency(
-            EPS_FREQ, wdm_set, m_ref=m_ref, num_layers_diff=NUM_LAYERS_DIFF
+            EPS_FREQ, wdm_set, m_ref=m_ref, num_layers_diff=NUM_LAYERS_DIFF,
         )
 
-        fdot_vals = np.array([0.0])
-        # fdot_vals = WDMLookupTable.apply_eps_fdot(0.2, wdm_set, fdot_max_factor=1.0)
+        if FDOT_EPS > 0.0:
+            fdot_vals = WDMLookupTable.apply_eps_fdot(
+                FDOT_EPS, wdm_set, fdot_max_factor=FDOT_MAX_FACTOR,
+            )
+        else:
+            fdot_vals = np.array([0.0])
+        print(f"[step] fdot_vals: n={len(fdot_vals)}  "
+              f"range=[{float(np.min(fdot_vals)):.3e}, {float(np.max(fdot_vals)):.3e}]", flush=True)
 
         nchannel = 3
-        wdm_lookup_table = WDMLookupTable(wdm_set, nchannel, norm_freq_single_layer=norm_freq_single_layer, m_diffs=m_diffs, fdot_vals=fdot_vals, m_ref=m_ref, batch_size_gen=5, td_window=td_window, store_path=store_path)
+        # TIME_LAYERS — small Nt for the build (Plan A only reads one
+        # pixel, so a much smaller Nt is equivalent and 10×+ faster).
+        # Must have (TIME_LAYERS // 2) parity matching (wdm_set.Nt // 2).
+        TIME_LAYERS_ENV = os.environ.get("TIME_LAYERS", "")
+        if TIME_LAYERS_ENV.strip():
+            _time_layers = int(TIME_LAYERS_ENV)
+        else:
+            _time_layers = None
+        wdm_lookup_table = WDMLookupTable(
+            wdm_set, nchannel,
+            norm_freq_single_layer=norm_freq_single_layer,
+            m_diffs=m_diffs,
+            fdot_vals=fdot_vals,
+            m_ref=m_ref,
+            batch_size_gen=int(os.environ.get("BATCH_SIZE_GEN", "5")),
+            td_window=td_window,
+            store_path=store_path,
+            verbose=True,
+            build_kind=BUILD_KIND,
+            time_layers=_time_layers,
+        )
 
-    # this tests cubic spline accuracy for python setup
-    # C setup currently does central differencing at the wdm grid
+    # Quick sanity on the loaded table: under fdot=0 the sin branch at
+    # (m_ref, n_ref) is rotation-only noise; once fdot != 0 it carries
+    # real content. Print magnitudes so a fresh build is easy to eyeball.
+    _sin_mag = float(np.max(np.abs(wdm_lookup_table.get(wdm_lookup_table.table_sin))))
+    _cos_mag = float(np.max(np.abs(wdm_lookup_table.get(wdm_lookup_table.table_cos))))
+    print(f"[diag] table_sin max|.| = {_sin_mag:.3e}  table_cos max|.| = {_cos_mag:.3e}  "
+          f"build_kind={wdm_lookup_table.build_kind}  fdot_steps={len(wdm_lookup_table.fdot_vals)}", flush=True)
+
+    # F_FRACS sweep: comma-separated f_frac values to test. Defaults span
+    # on-grid (~0/1) and mid-grid (~0.5) per the Plan A validation request.
+    # Set F_FRAC for a single value, F_FRACS for a list.
+    if "F_FRAC" in os.environ:
+        _f_frac_list = [float(os.environ["F_FRAC"])]
+    else:
+        _f_frac_list = [float(s) for s in os.environ.get("F_FRACS", "0.05,0.5,0.95").split(",")]
+
+    # Shared one-shot construction (does not depend on f_frac).
+    output_set = wdm_set
+    if output_set != wdm_set:
+        raise ValueError("This script requires WDM for the output_set.")
+    sens_mat_proto = None  # build once injection settings are known
+
     N_sparse = int(os.environ.get("N_SPARSE", 4096))
-    print(f"[step] N_sparse={N_sparse}", flush=True)
+    print(f"[step] N_sparse={N_sparse}  f_fracs={_f_frac_list}", flush=True)
     t_tdi_sparse = xp.linspace(t_arr[0], t_arr[-1], N_sparse)
 
-    gb_comps = GBWDMComputations(wdm_lookup_table, Tobs, t_ref, orbits=orbits, tdi_config=tdi_config, force_backend=backend)
-    gb_gen_wrap = GBLookupWaveWrap(
-        t_arr, 
-        t_tdi_sparse, 
-        Tobs,
-        t_ref,
-        dt,
-        params.shape[0],
-        gb_tdi_kwargs,
-        td_set, 
-        output_set,
-        window
-    )
+    # C lookup now supports both per_n and n_ref_only via the LookupKind
+    # enum (TDIonTheFly.hh) — default to running for either build kind.
+    # RUN_C_LOOKUP=0 to force-skip.
+    _run_c_lookup = os.environ.get("RUN_C_LOOKUP", "auto") != "0"
+    gb_comps = None
+    if _run_c_lookup:
+        gb_comps = GBWDMComputations(wdm_lookup_table, Tobs, t_ref, orbits=orbits, tdi_config=tdi_config, force_backend=backend)
+    else:
+        print(f"[step] skipping C lookup path (build_kind={wdm_lookup_table.build_kind}, "
+              f"RUN_C_LOOKUP={os.environ.get('RUN_C_LOOKUP', 'auto')})", flush=True)
 
-    analysis = AnalysisContainer(injection, sens_mat, signal_gen=gb_gen_wrap)
+    _results = []
+    # M_OFFSET shifts the source's m_floor by an integer relative to the
+    # table's m_ref (e.g., M_OFFSET=1 puts the source one full layer above
+    # m_ref while preserving f_frac). Use to probe whether per-layer
+    # residual asymmetry depends on the parity/index of the source's m_floor.
+    _m_offset = int(os.environ.get("M_OFFSET", "0"))
+    for _ff_idx, _ff in enumerate(_f_frac_list):
+        num_bin = 1
+        amp = np.full(num_bin, 8.0e-22)
+        f0 = np.full(num_bin, (wdm_lookup_table.m_ref + _m_offset + _ff) * wdm_set.layer_df)
+        # SOURCE_FDOT (Hz/s). Default 1e-17 (essentially fdot=0). Set to
+        # something in the lookup table's fdot range to exercise the
+        # fdot interpolation path.
+        fdot = np.full(num_bin, float(os.environ.get("SOURCE_FDOT", "1e-17")))
+        fddot = np.full(num_bin, 0.0)
+        phi0 = np.full(num_bin, 2.09802430298)
+        inc = np.full(num_bin, 0.23984234)
 
-    wdm_holder = AnalysisContainerArray([analysis])
+        # NEED TO ADD FRAME TRANSFORM FOR PSI IF WORKING IN ECLIPTIC
+        psi = np.full(num_bin, 1.234019814)
+        lam = np.full(num_bin, 4.09808143)
+        beta = np.full(num_bin, float(os.environ.get("BETA", "0.04")))
+        params = np.array([amp, f0, fdot, fddot, phi0, inc, psi, lam, beta]).T
 
-    template_fill = xp.zeros(3 * np.prod(wdm_set.basis_shape_active), dtype=float)
-    # Pass convert_to_ra_dec=False so the C kernel uses the same ecliptic frame
-    # as the injection and Python wrap (default would apply ecliptic→ICRS, shifting
-    # the source location and making C and Python results diverge).
-    gb_comps.fill_global_wdm(template_fill, params, wdm_holder, data_index=None, convert_to_ra_dec=False)
-    template_fill_wdm = WDMSignal(template_fill.reshape((3,) + wdm_set.basis_shape_active), wdm_set)
-    check_ll_2 = analysis.template_likelihood(template_fill_wdm)  # template_likelihood ignores psd likelihood by default
-    check_ip_2 = analysis.template_inner_product(template_fill_wdm)
-    check_ip_d_d = analysis.inner_product()
-    overlap = analysis.template_inner_product(template_fill_wdm, normalize=True)
+        # Fresh injection buffer per iteration.
+        _data_inj = xp.zeros_like(data_inj)
+        inj_tmp = gb_gen_inj(amp, f0, fdot, fddot, phi0, inc, psi, lam, beta,
+                             convert_to_ra_dec=False, return_spline=True)
+        _data_inj[:] = inj_tmp.eval_tdi(t_arr)
 
+        # NOTE Plan A: keep the outer transform window as ones (line ~189)
+        # so the injection has no global Tukey taper. min_time/max_time on
+        # wdm_set already trims ~20 wavelet pixels off each edge.
+        data_inj_all = TDSignal(_data_inj, settings=td_set).transform(output_set, window=window)
+        injection = DataResidualArray(data_inj_all)
+        if sens_mat_proto is None:
+            sens_mat_proto = XYZ2SensitivityMatrix(injection.data_res_arr.settings, model="scirdv1")
+        sens_mat = sens_mat_proto
+
+        gb_gen_wrap = GBLookupWaveWrap(
+            t_arr, t_tdi_sparse, Tobs, t_ref, dt,
+            params.shape[0], gb_tdi_kwargs, td_set, output_set, window,
+        )
+        analysis = AnalysisContainer(injection, sens_mat, signal_gen=gb_gen_wrap)
+        wdm_holder = AnalysisContainerArray([analysis])
+
+        template_fill_wdm = None
+        check_ll_2 = check_ip_2 = overlap = None
+        if gb_comps is not None:
+            template_fill = xp.zeros(3 * np.prod(wdm_set.basis_shape_active), dtype=float)
+            gb_comps.fill_global_wdm(template_fill, params, wdm_holder, data_index=None, convert_to_ra_dec=False)
+            template_fill_wdm = WDMSignal(template_fill.reshape((3,) + wdm_set.basis_shape_active), wdm_set)
+            check_ll_2 = analysis.template_likelihood(template_fill_wdm)
+            check_ip_2 = analysis.template_inner_product(template_fill_wdm)
+            overlap = analysis.template_inner_product(template_fill_wdm, normalize=True)
+
+        check_ip_d_d = analysis.inner_product()
+        py_wdm_lookup = gb_gen_wrap(*params[0])
+        tmp_val1 = analysis.template_inner_product(py_wdm_lookup)
+        tmp_val2 = analysis.calculate_signal_inner_product(*params[0])
+        tmp_val3 = analysis.calculate_signal_likelihood(*params[0], source_only=True)
+        overlap_py = analysis.template_inner_product(py_wdm_lookup, normalize=True)
+
+        _f_frac_meas = (f0[0] - (int(f0[0] / wdm_set.layer_df) * wdm_set.layer_df)) / wdm_set.layer_df
+        _mm_c  = float(1.0 - overlap) if overlap is not None else float("nan")
+        _mm_py = float(1.0 - overlap_py)
+
+        # mm5 — mismatch restricted to a narrow ±5-layer band around f0
+        # (matching gb_lookup_prior_draws.py's mismatch_5_layers convention:
+        # min_freq = f0 - 3*layer_df, max_freq = f0 + 2*layer_df). This
+        # focuses on the source's own neighborhood so the result is not
+        # diluted by spurious template energy in far-away pixels — more
+        # sensitive to lookup-table accuracy near the source.
+        _new_wdm_set = WDMSettings(
+            wdm_set.Nf, wdm_set.Nt, wdm_set.data_dt,
+            min_time=wdm_set.min_time, max_time=wdm_set.max_time,
+            min_freq=float(f0[0] - 3 * wdm_set.layer_df),
+            max_freq=float(f0[0] + 2 * wdm_set.layer_df),
+            force_backend=backend,
+        )
+        _m_lo = _new_wdm_set.ind_min_f - wdm_set.ind_min_f
+        _m_hi = _new_wdm_set.ind_max_f - wdm_set.ind_min_f + 1
+        _inj_here = DataResidualArray(WDMSignal(injection[:, _m_lo:_m_hi], _new_wdm_set))
+        _sens_here = XYZ2SensitivityMatrix(_new_wdm_set, model="scirdv1")
+        _ah5 = AnalysisContainer(_inj_here, _sens_here)
+        _mm_py5_C = _mm_py5 = float("nan")
+        if template_fill_wdm is not None:
+            _tpl_here_c = DataResidualArray(WDMSignal(template_fill_wdm[:, _m_lo:_m_hi], _new_wdm_set))
+            _mm_py5_C = float(1.0 - _ah5.template_inner_product(_tpl_here_c, normalize=True))
+        _tpl_here_py = DataResidualArray(WDMSignal(py_wdm_lookup[:, _m_lo:_m_hi], _new_wdm_set))
+        _mm_py5 = float(1.0 - _ah5.template_inner_product(_tpl_here_py, normalize=True))
+
+        _results.append((_ff, _f_frac_meas, _mm_c, _mm_py, _mm_py5_C, _mm_py5))
+
+        # SAVE_RESIDUAL=1 dumps the (injection - template) WDM array for
+        # this f_frac iteration so it can be heatmapped later. Saves to
+        # residual_ff{f_frac:.3f}_ch{ch}.npy for ch=0,1,2 plus a summary
+        # of per-(m,n) absolute residual.
+        if os.environ.get("SAVE_RESIDUAL", "0") == "1":
+            _inj_arr = data_inj_all.arr   # (3, Nf_active, Nt_active)
+            _tpl_arr = py_wdm_lookup.arr
+            _resid = _inj_arr - _tpl_arr
+            _ms = int(f0[0] / wdm_set.layer_df)
+            _m_active = _ms - wdm_set.ind_min_f
+            np.savez_compressed(
+                f"residual_ff{_ff:.3f}.npz",
+                inj=_inj_arr, tpl=_tpl_arr, resid=_resid,
+                m_source_active=_m_active, m_source_abs=_ms,
+                ind_min_f=wdm_set.ind_min_f, ind_min_t=wdm_set.ind_min_t,
+                layer_df=wdm_set.layer_df, layer_dt=wdm_set.layer_dt,
+                f0=float(f0[0]),
+            )
+            # Print per-layer L2 of residual to locate the bulk of the error.
+            _r_per_m = np.sqrt((_resid ** 2).sum(axis=(0, 2)))  # (Nf_active,)
+            _i_per_m = np.sqrt((_inj_arr ** 2).sum(axis=(0, 2)))
+            print(f"  [resid] saved residual_ff{_ff:.3f}.npz; "
+                  f"source at m_abs={_ms} (active {_m_active})")
+            print(f"  [resid] per-layer  m_off   ||resid||   ||inj||   ratio")
+            for _moff in [-3, -2, -1, 0, 1, 2, 3]:
+                _mi = _m_active + _moff
+                if 0 <= _mi < _r_per_m.size:
+                    print(f"          {_moff:+5d}    {_r_per_m[_mi]:.3e}   "
+                          f"{_i_per_m[_mi]:.3e}   "
+                          f"{_r_per_m[_mi] / max(_i_per_m[_mi], 1e-30):.3e}")
+
+        # Per-pixel diagnostic: pick 8 pixels in the dominant source layer and
+        # compare injection vs Python lookup template side-by-side.
+        if os.environ.get("DIAG_PIXEL", "0") == "1":
+            _inj_arr = data_inj_all.arr  # (3, Nf_active, Nt_active)
+            _tpl_arr = py_wdm_lookup.arr
+            _ms = int(f0[0] / wdm_set.layer_df)
+            _m_active = _ms - wdm_set.ind_min_f
+            print(f"  [diag] source ms={_ms}, ind_min_f={wdm_set.ind_min_f}, "
+                  f"layer in active grid = {_m_active}")
+            for _ch in [0]:
+                for _m_off in [-1, 0, 1]:
+                    _m = _m_active + _m_off
+                    if _m < 0 or _m >= _inj_arr.shape[1]:
+                        continue
+                    _inj_row = _inj_arr[_ch, _m, :]
+                    _tpl_row = _tpl_arr[_ch, _m, :]
+                    _rms_inj = float(np.sqrt(np.mean(_inj_row**2)))
+                    _rms_tpl = float(np.sqrt(np.mean(_tpl_row**2)))
+                    _ratio = _rms_tpl / _rms_inj if _rms_inj > 0 else float("nan")
+                    _dot = float(np.sum(_inj_row * _tpl_row))
+                    _norm = float(np.sqrt(np.sum(_inj_row**2) * np.sum(_tpl_row**2)) + 1e-300)
+                    _cosine = _dot / _norm if _norm > 0 else float("nan")
+                    print(f"  [diag] ch={_ch} layer_off={_m_off:+d} (m={_ms+_m_off})  "
+                          f"rms_inj={_rms_inj:.3e} rms_tpl={_rms_tpl:.3e}  "
+                          f"ratio={_ratio:.3f}  cosine={_cosine:+.4f}")
+                    # show first 6 active pixel values
+                    print(f"        inj first 6: {_inj_row[:6]}")
+                    print(f"        tpl first 6: {_tpl_row[:6]}")
+
+        print(f"\n=== f_frac sweep [{_ff_idx + 1}/{len(_f_frac_list)}]  "
+              f"requested={_ff:.3f}  measured={_f_frac_meas:+.4f}  "
+              f"f0={f0[0]*1e3:.5f} mHz ===")
+        print(f"[result] base inner_product <d|d>           = {check_ip_d_d}")
+        if gb_comps is not None:
+            print(f"[result] template_inner_product (C lookup)  = {check_ip_2}")
+        print(f"[result] template_inner_product (py lookup) = {tmp_val1}")
+        print(f"[result] calculate_signal_inner_product     = {tmp_val2}")
+        if gb_comps is not None:
+            print(f"[result] template_likelihood (C lookup)     = {check_ll_2}")
+        print(f"[result] template_likelihood (py lookup)    = {tmp_val3}")
+        if gb_comps is not None:
+            print(f"[result] Noise-weighted mismatch (C  lookup) = {_mm_c:.3e}")
+        print(f"[result] Noise-weighted mismatch (py lookup) = {_mm_py:.3e}")
+        if gb_comps is not None:
+            print(f"[result] mm5 (±5-layer band, C  lookup)      = {_mm_py5_C:.3e}")
+        print(f"[result] mm5 (±5-layer band, py lookup)      = {_mm_py5:.3e}")
+
+        _nrows = 3 if template_fill_wdm is not None else 2
+        fig, axes = plt.subplots(_nrows, 1, sharex=True, sharey=True, figsize=(11, 8))
+        if _nrows == 2:
+            ax1, ax3 = axes
+            ax2 = None
+        else:
+            ax1, ax2, ax3 = axes
+        data_inj_all.heatmap(fig=fig, ax=ax1, index=0, add_cax=True)
+        if ax2 is not None:
+            template_fill_wdm.heatmap(fig=fig, ax=ax2, index=0)
+        py_wdm_lookup.heatmap(fig=fig, ax=ax3, index=0)
+        ax1.set_title(
+            f"injection  f0={f0[0]*1e3:.5f} mHz  phi0={phi0[0]:.4f}  "
+            f"f_frac={_f_frac_meas:+.3f}  (build_kind={wdm_lookup_table.build_kind})"
+        )
+        if ax2 is not None:
+            ax2.set_title(f"C lookup template  (mm = {_mm_c:.3e})")
+        ax3.set_title(f"py lookup template  (mm = {_mm_py:.3e})")
+        ax1.set_ylim(f0[0] - 10 * wdm_set.layer_df, f0[0] + 10 * wdm_set.layer_df)
+        plt.tight_layout()
+        _out_path = f"gb_lookup_{wdm_lookup_table.build_kind}_ff{_f_frac_meas:+.3f}.png"
+        plt.savefig(_out_path, dpi=120)
+        if os.environ.get("SHOW_PLOTS", "0") == "1":
+            plt.show()
+        plt.close(fig)
+        print(f"[plot] saved {_out_path}")
+
+    print("\n[summary] f_frac sweep")
+    print(f"  build_kind = {wdm_lookup_table.build_kind}")
+    print(f"  fdot_steps = {len(wdm_lookup_table.fdot_vals)}")
+    print("  requested  measured  mm_C        mm_py       mm5_C       mm5_py")
+    for _ff, _ff_m, _mm_c, _mm_py, _mm_c5, _mm_py5 in _results:
+        print(f"  {_ff:>9.3f}  {_ff_m:+.4f}   {_mm_c:.3e}   {_mm_py:.3e}   {_mm_c5:.3e}   {_mm_py5:.3e}")
+
+    if os.environ.get("DEBUG_BREAK", "0") == "1":
+        breakpoint()
     # ---- spline-path smoke check vs direct path -------------------------------
     # Set RUN_SPLINE_CHECK=1 to run the spline-flavored fill/get_ll/swap_ll/grad
     # kernels and report max-rel-diff vs the direct path on the same source.
@@ -646,21 +933,7 @@ if __name__ == "__main__":
         print(f"  swap-gradient worst rel = {worst_swap_grad:.3e}   tol = {grad_tol}   [{status}]\n")
 
     # The wrap's __call__ takes the 9 scalar params as *args (see GBLookupWaveWrap above).
-    py_wdm_lookup = gb_gen_wrap(*params[0])
-    tmp_val1 = analysis.template_inner_product(py_wdm_lookup)
-    tmp_val2 = analysis.calculate_signal_inner_product(*params[0])
-    tmp_val3 = analysis.calculate_signal_likelihood(*params[0], source_only=True)
-    overlap_py = analysis.template_inner_product(py_wdm_lookup, normalize=True)
-
-    print(f"\n[result] base inner_product <d|d>            = {check_ip_d_d}")
-    print(f"[result] template_inner_product (C lookup)     = {check_ip_2}")
-    print(f"[result] template_inner_product (py lookup)    = {tmp_val1}")
-    print(f"[result] calculate_signal_inner_product        = {tmp_val2}")
-    print(f"[result] template_likelihood (C lookup)        = {check_ll_2}\n")
-    print(f"[result] template_likelihood (py lookup)        = {tmp_val3}\n")
-    print(f"[result] Noise-weighted mismatch (C lookup)        = {1.0 - overlap}\n")
-    print(f"[result] Noise-weighted mismatch (py lookup)        = {1.0 - overlap_py}\n")
-
+    
     # Per-channel AET cross-check: convert XYZ → AET in WDM space and compare
     # each orthogonal AET channel separately (they decouple under AET1Sens).
     from lisatools.sensitivity import AET1SensitivityMatrix

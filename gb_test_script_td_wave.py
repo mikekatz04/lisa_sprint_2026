@@ -72,7 +72,7 @@ if __name__ == "__main__":
     dt = 10.0  # mojito
     _Tobs = 1. * YRSID_SI
     # between half day and 3/4 day. Will be very close to half day
-    (Nf, Nt, wavelet_duration) = WDMSettings.adjust_to_even_bins(0.5 * 24 * 3600.0, 0.75 * 24 * 3600.0, dt, _Tobs)
+    (Nf, Nt, wavelet_duration) = WDMSettings.adjust_to_even_bins(2 * 3600.0, 3 * 24 * 3600.0, dt, _Tobs)
     Tobs = Nt * wavelet_duration
     Nobs = Nf * Nt
 
@@ -104,23 +104,9 @@ if __name__ == "__main__":
     )
 
 
-    N_sparse = 128
+    N_sparse = 16384
 
     t_tdi_sparse = xp.linspace(t_arr[0], t_arr[-1], N_sparse)
-
-    num_bin = 1
-    amp = np.full(num_bin, 8.0e-23)
-    f0 = np.full(num_bin, 2.0e-3)  # (ind + i / num) * wdm_settings.layer_df)
-    fdot = np.full(num_bin, 1e-17)
-    fddot = np.full(num_bin, 0.0)
-    phi0 = np.full(num_bin, 2.09802430298)
-    inc = np.full(num_bin, 0.23984234)
-
-    # NEED TO ADD FRAME TRANSFORM FOR PSI IF WORKING IN ECLIPTIC
-    psi = np.full(num_bin, 1.234019814)
-    lam = np.full(num_bin, 4.09808143)
-    beta = np.full(num_bin, 0.090)
-    params = np.array([amp, f0, fdot, fddot, phi0, inc, psi, lam, beta]).T
 
     N = data_inj.shape[-1]
     td_set = TDSettings(N, dt, force_backend=backend)
@@ -133,10 +119,25 @@ if __name__ == "__main__":
     fd_set = FDSettings(N_fd, df, min_freq=min_freq, max_freq=max_freq, force_backend=backend)
 
     # shave edges?
-    min_time = 5 * wavelet_duration
-    max_time = (Nt - 5) * wavelet_duration
+    min_time = 20 * wavelet_duration
+    max_time = (Nt - 20) * wavelet_duration
 
     wdm_set = WDMSettings(Nf, Nt, dt, min_freq=min_freq, max_freq=max_freq, min_time=min_time, max_time=max_time)
+    
+    num_bin = 1
+    amp = np.full(num_bin, 8.0e-23)
+    f0 = np.full(num_bin, 100 * wdm_set.layer_df)  # (ind + i / num) * wdm_settings.layer_df)
+    fdot = np.full(num_bin, 0.0)  # 1e-17)
+    fddot = np.full(num_bin, 0.0)
+    phi0 = np.full(num_bin, 2.09802430298)
+    inc = np.full(num_bin, 0.23984234)
+
+    # NEED TO ADD FRAME TRANSFORM FOR PSI IF WORKING IN ECLIPTIC
+    psi = np.full(num_bin, 1.234019814)
+    lam = np.full(num_bin, 4.09808143)
+    beta = np.full(num_bin, 0.090)
+    params = np.array([amp, f0, fdot, fddot, phi0, inc, psi, lam, beta]).T
+
     inj_tmp = gb_gen_inj(amp, f0, fdot, fddot, phi0, inc, psi, lam, beta, convert_to_ra_dec=False, return_spline=True)
     data_inj[:] = inj_tmp.eval_tdi(t_arr)
 
@@ -155,6 +156,7 @@ if __name__ == "__main__":
         window
     )
 
+    template_sparse = gb_gen_wrap(*params[0])
     template_sparse = gb_gen_wrap(*params[0])
 
     # plot
