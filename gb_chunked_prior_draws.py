@@ -91,6 +91,11 @@ def main():
     SEED = int(os.environ.get("SEED", 12345))
     OUTPUT_PREFIX = os.environ.get("OUTPUT_PREFIX", "gb_prior_chunked_test")
     PROGRESS_EVERY = int(os.environ.get("PROGRESS_EVERY", 1))
+    SAVE_HEATMAPS_N = int(os.environ.get("SAVE_HEATMAPS_N", 0))
+    # Number of draws for which to compare lisatools.calculate_signal_likelihood
+    # (source_only=True) vs chunked-het cpp.get_ll across a small ladder of
+    # parameter perturbations (slope-1 scatter test). 0 = disabled.
+    LIKELIHOOD_COMPARE_N = int(os.environ.get("LIKELIHOOD_COMPARE_N", 0))
 
     # --- chunked-heterodyne knobs ------------------------------------------
     Nt_sub = int(os.environ.get("NT_SUB",  256))
@@ -156,6 +161,9 @@ def main():
         backend=backend, tdi_gen="2nd generation",
         orbits=orbits,                                  # MUST match injection
         t_obs_start=float(t_start),                     # MUST match t_arr[0]
+        # Cache knobs (default 0 = direct; override via env to engage cache).
+        N_cp_sig   = int(os.environ.get("N_CP_SIG",   0)),
+        N_cp_orbit = int(os.environ.get("N_CP_ORBIT", 0)),
     )
     print(f"[run] chunked: n_chunks={len(chunked.geometry['starts'])}, "
           f"T_chunk={chunked.T_chunk:.3e}s, alpha={chunked.tukey_alpha}, "
@@ -187,12 +195,27 @@ def main():
     print(f"[run] f0 range = [{f0_lo_hz*1e3:.4f}, {f0_hi_hz*1e3:.4f}] mHz "
           f"(layer_df = {layer_df:.3e} Hz)", flush=True)
 
+    # --- signal_gen wrapper: params (9,) -> WDMSignal --------------------
+    # Closes over gb_gen_inj + td_set + wdm_set so the analysis container
+    # can drop it in as `signal_gen`. Returns a WDMSignal directly so
+    # AnalysisContainer can wrap it in a DataResidualArray.
+    def _chunked_signal_gen(*params, **kwargs):
+        params_arr = np.asarray(params, dtype=float).reshape(9, 1)
+        inj_spline = gb_gen_inj(
+            *params_arr, convert_to_ra_dec=False, return_spline=True,
+        )
+        td = np.asarray(inj_spline.eval_tdi(t_arr))[0]
+        return TDSignal(td, settings=td_set).transform(wdm_set, window=None)
+
     # --- per-draw loop ----------------------------------------------------
     sens_mat = None
     snr_list, log_like_list, mismatch_list = [], [], []
     log_like_5_layers_list, mismatch_5_layers_list = [], []
     log_like_2_layers_list, mismatch_2_layers_list = [], []
     params_list = []
+    # logL slope-1 scatter (lisatools vs chunked-het cpp.get_ll)
+    ll_lisatools_list = []
+    ll_cpp_list = []
     attempt_total = 0
     t_loop_start = time.perf_counter()
 
@@ -322,6 +345,178 @@ def main():
         log_like_2_layers_list.append(log_like_2)
         mismatch_2_layers_list.append(mm2)
 
+        # --- heatmap PNG for the first SAVE_HEATMAPS_N draws ------------
+        if i < SAVE_HEATMAPS_N:
+            inj_arr_5 = np.asarray(inj_band.arr)[0]      # (5_layers, Nt_active)
+            tpl_arr_5 = np.asarray(tpl_band.arr)[0]
+            diff_5    = tpl_arr_5 - inj_arr_5
+            vmax = max(np.abs(inj_arr_5).max(),
+                       np.abs(tpl_arr_5).max(), 1e-30)
+            vmin = -vmax
+            layers = np.arange(m_floor - 3, m_floor + 3)[:inj_arr_5.shape[0]]
+            t_days = np.arange(inj_arr_5.shape[1]) * (dt * Nf) / 86400.0
+            fig, axes = plt.subplots(1, 3, figsize=(15, 3.8), sharey=True)
+            for ax, arr, ttl in zip(
+                axes, (inj_arr_5, tpl_arr_5, diff_5),
+                ("injection (WDM)",
+                 "chunked-het template",
+                 "template - injection"),
+            ):
+                im = ax.pcolormesh(t_days, layers, arr,
+                                    shading="auto", cmap="RdBu_r",
+                                    vmin=vmin, vmax=vmax)
+                ax.set_xlabel("t [days]")
+                ax.set_title(ttl)
+            axes[0].set_ylabel(f"m-layer  (m_floor={m_floor})")
+            fig.colorbar(im, ax=axes, fraction=0.025, pad=0.02,
+                          label="WDM coeff (channel 0)")
+            f_frac_hm = (f0 - m_floor * layer_df) / layer_df
+            fig.suptitle(
+                f"draw {i+1}/{SAVE_HEATMAPS_N}  "
+                f"SNR={snr:.1f}  logL={log_like:+.3e}  "
+                f"mm5={mm5:.2e}  mm2={mm2:.2e}\n"
+                f"f0={f0*1e3:.4f} mHz  m_floor={m_floor}  f_frac={f_frac_hm:.2f}  "
+                f"beta={float(params_i[8]):+.3f}rad  "
+                f"lam={float(params_i[7]):.3f}rad  "
+                f"psi={float(params_i[6]):.3f}rad  "
+                f"inc={float(params_i[5]):.3f}rad",
+                fontsize=9,
+            )
+            fig.tight_layout(rect=(0, 0, 1, 0.92))
+            hm_png = f"{OUTPUT_PREFIX}_heatmap_draw{i+1:02d}.png"
+            fig.savefig(hm_png, dpi=110)
+            plt.close(fig)
+            print(f"     wrote {hm_png}", flush=True)
+
+        # --- lisatools.calculate_signal_likelihood vs cpp.get_ll ---------
+        # For the first LIKELIHOOD_COMPARE_N draws, evaluate logL at the
+        # injection plus a small ladder of parameter perturbations and
+        # collect (lisatools, cpp) pairs for a slope-1 scatter plot.
+        #
+        # The injection + sens_mat live on the WDM active band (Nf_active,
+        # Nt_active). The chunked-het kernel needs them on the FULL grid
+        # (Nf, Nt) -- we zero-fill outside the active band. The inner
+        # product is unchanged because both d and h are zero off-band.
+        if i < LIKELIHOOD_COMPARE_N:
+            # Attach signal_gen for lisatools path.
+            analysis.signal_gen = _chunked_signal_gen
+            # The chunked-het kernel currently iterates m in [0, Nf) on
+            # the full WDM grid, so we zero-fill the active-band injection
+            # and inverse-PSD onto (3, Nf, Nt). FUTURE OPT (per design
+            # note): teach the kernel to iterate only [ind_min_f,
+            # ind_max_f] and accept active-band arrays directly --
+            # cuts ~50% of the per-pixel work on this Nf=1460 config.
+            nch = 3
+            inj_active = np.asarray(wdm_inj_sig.arr)
+            psd_active = np.asarray(sens_mat.sens_mat)
+            # sens_mat may be cross-channel (3, 3, Nf_a, Nt_a) -- take the
+            # diagonal (per-channel PSD) for the chunked-het kernel which
+            # only consumes a diagonal invC (3, Nf, Nt). FUTURE OPT: pipe
+            # the cross-channel PSD through the kernel.
+            if psd_active.ndim == 4:
+                psd_diag = np.stack([psd_active[c, c] for c in range(nch)], axis=0)
+            else:
+                psd_diag = psd_active
+            # Sanitize PSD: lisatools' sens model divides by f, so f=0
+            # produces inf/NaN. Treat inf/NaN/<=0 as "infinite PSD"
+            # (invC=0), which mirrors lisatools' template_likelihood
+            # behavior of skipping those pixels.
+            with np.errstate(divide="ignore", invalid="ignore"):
+                invC_active = 1.0 / np.where(
+                    np.isfinite(psd_diag) & (psd_diag > 0),
+                    psd_diag, np.inf,
+                )
+            invC_active = np.where(np.isfinite(invC_active),
+                                    invC_active, 0.0)
+
+            data_d_full = np.zeros((nch, Nf, Nt), dtype=float)
+            invC_full   = np.zeros_like(data_d_full)
+            ilo = wdm_set.ind_min_f
+            ihi = wdm_set.ind_max_f + 1
+            if wdm_set.Nt_active == wdm_set.Nt:
+                data_d_full[:, ilo:ihi, :] = inj_active
+                invC_full  [:, ilo:ihi, :] = invC_active
+            else:
+                tslice = wdm_set.active_slice_t
+                data_d_full[:, ilo:ihi, tslice] = inj_active
+                invC_full  [:, ilo:ihi, tslice] = invC_active
+
+            # lisatools' inner_product is 4 * differential_component *
+            # sum(sig1.conj * sig2 / PSD); the chunked-het kernel just
+            # returns the bare sum. Calibrate the scale empirically from
+            # the known <d|d> value (analysis.inner_product()):
+            #   d_d_lt = 4 * dc * sum(d*d*invC)  =>  scale = d_d_lt / sum_dd
+            sum_dd_chunked = float(np.sum(data_d_full * data_d_full * invC_full))
+            ll_scale = d_d / max(sum_dd_chunked, 1e-300)
+
+            #          [A,     f0,    fdot,   fddot,  phi0, inc,  psi,  lam,  beta]
+            pert_unit = np.array([
+                params_i[0] * 1e-3,   # A: 1e-3 fractional
+                params_i[1] * 1e-7,   # f0: 1e-7 fractional (~ sub-bin)
+                1e-19,                 # fdot
+                1e-23,                 # fddot
+                1e-2, 1e-2, 1e-2, 1e-2, 1e-2,  # angles: ~1e-2 rad
+            ])
+            rng_pert = np.random.default_rng(SEED + i)
+
+            # Pick a random direction (unit vector in pert_unit space).
+            direction = rng_pert.standard_normal(9)
+            direction = direction / np.linalg.norm(direction)
+
+            # Quick calibration via cpp.get_ll: pick a small alpha,
+            # measure resulting dlogL, then solve for alphas that hit
+            # target dlogL ~ 10/100/1000/10000 (quadratic scaling).
+            alpha_cal = max(1.0 / max(snr, 1.0), 1e-3)
+            p_cal = params_i + alpha_cal * pert_unit * direction
+            dh_cal, hh_cal = chunked.get_ll(
+                data_d_full, invC_full, [tuple(p_cal.tolist())],
+            )
+            ll_cal = (ll_scale * float(dh_cal[0] - 0.5 * hh_cal[0])
+                       - 0.5 * d_d)
+            dll_cal = abs(ll_cal)  # vs injection ll=0
+            if dll_cal <= 0 or not np.isfinite(dll_cal):
+                print(f"     [warn] calibration failed (dll_cal={dll_cal}), "
+                      f"skipping logL-compare for this draw", flush=True)
+            else:
+                target_dlogLs = [10.0, 100.0, 1000.0, 10000.0]
+                alphas = [alpha_cal * float(np.sqrt(t / dll_cal))
+                           for t in target_dlogLs]
+                eval_alphas = [0.0] + alphas        # injection + 4 targets
+
+                ll_lt_local, ll_cpp_local = [], []
+                for alpha in eval_alphas:
+                    if alpha == 0.0:
+                        p = params_i
+                    else:
+                        p = params_i + alpha * pert_unit * direction
+                    try:
+                        ll_lt = float(np.real(
+                            analysis.calculate_signal_likelihood(
+                                *p, source_only=True,
+                            )
+                        ))
+                    except Exception as e:
+                        print(f"     [warn] lisatools logL failed at "
+                              f"alpha={alpha:.3e}: {e}", flush=True)
+                        continue
+                    dh_cpp, hh_cpp = chunked.get_ll(
+                        data_d_full, invC_full, [tuple(p.tolist())],
+                    )
+                    dh_cpp_lt = ll_scale * float(dh_cpp[0])
+                    hh_cpp_lt = ll_scale * float(hh_cpp[0])
+                    ll_cpp = -0.5 * (d_d + hh_cpp_lt - 2.0 * dh_cpp_lt)
+                    ll_lt_local.append(ll_lt)
+                    ll_cpp_local.append(ll_cpp)
+                ll_lisatools_list.extend(ll_lt_local)
+                ll_cpp_list.extend(ll_cpp_local)
+                tgt_str = "[inj] " + " ".join(
+                    f"~{int(t)}" for t in target_dlogLs
+                )
+                print(f"     [logL-compare] targets={tgt_str}  "
+                      f"lt={[f'{v:+.3e}' for v in ll_lt_local]}  "
+                      f"cpp={[f'{v:+.3e}' for v in ll_cpp_local]}",
+                      flush=True)
+
         if (i + 1) % PROGRESS_EVERY == 0 or i == 0:
             elapsed = time.perf_counter() - t_loop_start
             rate = (i + 1) / max(elapsed, 1e-9)
@@ -346,6 +541,8 @@ def main():
         mismatch_5=np.asarray(mismatch_5_layers_list),
         log_like_2=np.asarray(log_like_2_layers_list),
         mismatch_2=np.asarray(mismatch_2_layers_list),
+        ll_lisatools=np.asarray(ll_lisatools_list),
+        ll_cpp=np.asarray(ll_cpp_list),
         Nf=Nf, Nt=Nt, dt=dt, Nt_sub=Nt_sub, N_sparse=N_sparse, n_pad=n_pad,
     )
     print(f"[save] wrote {out_npz}", flush=True)
@@ -370,6 +567,87 @@ def main():
     fig.savefig(f"{OUTPUT_PREFIX}_hist.png", dpi=120)
     plt.close(fig)
     print(f"[plot] wrote {OUTPUT_PREFIX}_hist.png", flush=True)
+
+    # f0 / f_frac vs mm scatter (2x2: rows = (f0, f_frac), cols = (mm5, mm2)).
+    if len(params_list) > 0:
+        params_arr = np.asarray(params_list, dtype=float)
+        f0_arr = params_arr[:, 1]
+        m_floor_arr = np.floor(f0_arr / layer_df).astype(int)
+        f_frac_arr = f0_arr / layer_df - m_floor_arr
+        mm5_arr = np.asarray(mismatch_5_layers_list, dtype=float)
+        mm2_arr = np.asarray(mismatch_2_layers_list, dtype=float)
+        snr_arr = np.asarray(snr_list, dtype=float)
+        fig, axes = plt.subplots(2, 2, figsize=(13, 9), sharey="row")
+        for ax, x, xlabel in [
+            (axes[0, 0], f0_arr * 1e3, "f0 (mHz)"),
+            (axes[0, 1], f0_arr * 1e3, "f0 (mHz)"),
+            (axes[1, 0], f_frac_arr,   "f_frac (within layer)"),
+            (axes[1, 1], f_frac_arr,   "f_frac (within layer)"),
+        ]:
+            ax.set_xlabel(xlabel)
+        for ax, y, ylabel in [
+            (axes[0, 0], mm5_arr, "1 - O (mm5)"),
+            (axes[0, 1], mm2_arr, "1 - O (mm2)"),
+            (axes[1, 0], mm5_arr, "1 - O (mm5)"),
+            (axes[1, 1], mm2_arr, "1 - O (mm2)"),
+        ]:
+            ax.set_yscale("log")
+            ax.set_ylabel(ylabel)
+            ax.axhline(1e-9, color="red", lw=0.8, ls="--",
+                        label="mm = 1e-9 (science threshold)")
+        # Plot points colored by log10(SNR).
+        for ax, x, y in [
+            (axes[0, 0], f0_arr * 1e3, mm5_arr),
+            (axes[0, 1], f0_arr * 1e3, mm2_arr),
+            (axes[1, 0], f_frac_arr,   mm5_arr),
+            (axes[1, 1], f_frac_arr,   mm2_arr),
+        ]:
+            sc = ax.scatter(x, y, c=np.log10(np.maximum(snr_arr, 1e-3)),
+                              cmap="viridis", s=18, alpha=0.85)
+            ax.grid(True, alpha=0.3)
+        cbar = fig.colorbar(sc, ax=axes.ravel().tolist(), label="log10(SNR)",
+                              shrink=0.85, pad=0.02)
+        cbar.ax.tick_params(labelsize=9)
+        fig.suptitle(f"{OUTPUT_PREFIX}  N={len(params_list)} draws  "
+                     f"Nf={Nf} Nt_sub={Nt_sub} N_sparse={N_sparse}",
+                     fontsize=11)
+        fig.savefig(f"{OUTPUT_PREFIX}_f0_ffrac_mm.png", dpi=120)
+        plt.close(fig)
+        print(f"[plot] wrote {OUTPUT_PREFIX}_f0_ffrac_mm.png", flush=True)
+
+    # --- log-likelihood slope-1 scatter (lisatools vs chunked-het C++) ----
+    if len(ll_lisatools_list) >= 2:
+        ll_lt = np.asarray(ll_lisatools_list)
+        ll_cpp = np.asarray(ll_cpp_list)
+        fig, ax = plt.subplots(1, 1, figsize=(6.5, 6))
+        ax.scatter(ll_lt, ll_cpp, s=14, alpha=0.6, c="steelblue",
+                    edgecolors="none")
+        # diagonal
+        lo = float(min(ll_lt.min(), ll_cpp.min()))
+        hi = float(max(ll_lt.max(), ll_cpp.max()))
+        margin = 0.05 * (hi - lo) if hi > lo else 1.0
+        diag = np.array([lo - margin, hi + margin])
+        ax.plot(diag, diag, "k--", lw=1, alpha=0.6, label="slope-1")
+        # residual stats
+        resid = ll_cpp - ll_lt
+        denom = np.maximum(np.abs(ll_lt), np.abs(ll_cpp)) + 1e-300
+        rel = resid / denom
+        rmse = float(np.sqrt(np.mean(resid**2)))
+        med_abs = float(np.median(np.abs(resid)))
+        ax.set_xlabel("log-likelihood -- lisatools calculate_signal_likelihood "
+                       "(source_only=True)")
+        ax.set_ylabel("log-likelihood -- chunked-het cpp.get_ll  "
+                       "(<d|h> - 0.5<h|h>)")
+        ax.set_title(f"{OUTPUT_PREFIX}   N={len(ll_lt)}   "
+                      f"RMSE={rmse:.2e}  med|resid|={med_abs:.2e}  "
+                      f"max|rel|={float(np.max(np.abs(rel))):.2e}")
+        ax.legend(loc="upper left")
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(f"{OUTPUT_PREFIX}_ll_scatter.png", dpi=120)
+        plt.close(fig)
+        print(f"[plot] wrote {OUTPUT_PREFIX}_ll_scatter.png  "
+              f"(N={len(ll_lt)}, RMSE={rmse:.2e})", flush=True)
 
 
 if __name__ == "__main__":
