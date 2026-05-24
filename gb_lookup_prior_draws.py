@@ -382,16 +382,35 @@ def main():
         log_like_5_layers_list.append(log_like_5_layers)
         mismatch_5_layers_list.append(mismatch_5_layers)
 
-        # ---- mismatch over ONLY the dominant 2 layers (m_floor, m_floor+1)
-        # This isolates the direct K-interp / FFT-leakage error in the
-        # layers that carry the GB signal, with no contribution from the
-        # m±2 far-tail leakage. Compares to the 5-layer mismatch to size
-        # the direct vs leakage components.
+        # ---- mismatch over the source's 2 DOMINANT layers.
+        # For any f0 in (m_floor*df, (m_floor+1)*df), the two layer centres
+        # bracketing f0 are m_floor and m_floor+1 — they're always the
+        # two closest centres regardless of f_frac. The pair only switches
+        # when m_floor itself ticks over (i.e. f_frac wraps through 0).
+        #
+        # Previous formulation used [f0, f0+df] which, after WDMSettings'
+        # ceil(min_freq/df) / int(max_freq/df) snapping, ended up covering
+        # ONE layer (m_floor+1) for any f_frac > 0 — so ~17% of sources
+        # got mm2 ~ 1.0 not because of a real lookup error but because
+        # the band missed the wavelet main lobe entirely.
+        _mfloor = int(params_i[1] / wdm_set.layer_df)
+        _ffrac = params_i[1] / wdm_set.layer_df - _mfloor
+        _m_lo, _m_hi = _mfloor, _mfloor + 1
+        # WDMSettings snapping: ind_min_f = ceil(min_freq/df),
+        # ind_max_f = int(max_freq/df). Use half-layer offsets on BOTH
+        # edges so we land exactly on [_m_lo, _m_hi] regardless of fp
+        # round-off (placing min_freq at m_lo*df exactly can ceil up to
+        # m_lo+1 if the fp multiply overshoots by 1 ULP).
         new_wdm_set_2 = WDMSettings(
             wdm_set.Nf, wdm_set.Nt, wdm_set.data_dt,
             min_time=wdm_set.min_time, max_time=wdm_set.max_time,
-            min_freq=params_i[1],
-            max_freq=params_i[1] + wdm_set.layer_df,
+            min_freq=(_m_lo - 0.5) * wdm_set.layer_df,
+            max_freq=(_m_hi + 0.5) * wdm_set.layer_df,
+        )
+        assert new_wdm_set_2.ind_min_f == _m_lo and new_wdm_set_2.ind_max_f == _m_hi, (
+            f"2-layer band indexing wrong: got [{new_wdm_set_2.ind_min_f}, "
+            f"{new_wdm_set_2.ind_max_f}], wanted [{_m_lo}, {_m_hi}] for "
+            f"f_frac={_ffrac:.4f}"
         )
         inj_2 = DataResidualArray(WDMSignal(
             injection[:,
