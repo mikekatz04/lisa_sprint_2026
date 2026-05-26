@@ -15,8 +15,8 @@ For each draw:
   2. Build an accurate dense-TD waveform via ``GBTDIonTheFly`` and
      transform it to the WDM domain (injection).
   3. Build the WDM template via
-     :meth:`gb_wdm_het.GBWDMHeterodyne.fill_global` (chunked-heterodyne
-     + Tukey-auto). NO lookup table.
+     :meth:`fastlisaresponse.gbcomps.GBWDMComputations.fill_global_wdm`
+     (chunked-heterodyne + Tukey-auto). NO lookup table.
   4. Compute ``log_like``, full-band, 5-layer, and 2-layer
      mismatches via ``AnalysisContainer.template_likelihood`` /
      ``template_inner_product`` -- identical to the lookup script so
@@ -58,7 +58,21 @@ from lisatools.domains import (
 )
 
 from gb_lookup_prior_draws import build_gb_prior
-from gb_wdm_het import GBWDMHeterodyne
+from fastlisaresponse.gbcomps import GBWDMComputations
+
+
+class _FullGridWDMHolder:
+    """Minimal duck-type for :meth:`GBWDMComputations.get_ll_wdm`'s
+    ``wdm_holder`` argument: exposes ``linear_data_arr[0]`` /
+    ``linear_psd_arr[0]`` / ``__len__`` over full-grid ``(3, Nf, Nt)``
+    data + diagonal invC buffers.
+    """
+    def __init__(self, data_full, invC_diag_full):
+        self.linear_data_arr = [np.ascontiguousarray(data_full).ravel()]
+        self.linear_psd_arr  = [np.ascontiguousarray(invC_diag_full).ravel()]
+
+    def __len__(self):
+        return 1
 
 
 def _make_wdm_signal_slice(full_wdm_arr, parent_set, min_freq, max_freq,
@@ -154,20 +168,28 @@ def main():
         force_backend=backend,
     )
 
-    # --- chunked-heterodyne generator -------------------------------------
-    chunked = GBWDMHeterodyne(
-        Nf=Nf, Nt=Nt, dt=dt, T_full=Tobs, t_ref_full=t_ref,
+    # --- chunked-heterodyne computations (template + likelihood) ----------
+    # ``GBWDMComputations`` is the FastLISAResponseParallelModule whose
+    # ``fill_global_wdm`` / ``get_ll_wdm`` route through
+    # ``GBComputationGroupWrap.gb_wdm_het_*`` on the chosen backend
+    # (C++ on cpu/cuda, pure-JAX on the ``jax`` backend).
+    chunked = GBWDMComputations(
+        Nf=Nf, Nt=Nt, dt=dt, T=Tobs, t_ref=t_ref,
         Nt_sub=Nt_sub, n_pad=n_pad, N_sparse=N_sparse,
-        backend=backend, tdi_gen="2nd generation",
-        orbits=orbits,                                  # MUST match injection
-        t_obs_start=float(t_start),                     # MUST match t_arr[0]
         # Cache knobs (default 0 = direct; override via env to engage cache).
         N_cp_sig   = int(os.environ.get("N_CP_SIG",   0)),
         N_cp_orbit = int(os.environ.get("N_CP_ORBIT", 0)),
+        t_obs_start=float(t_start),                     # MUST match t_arr[0]
+        orbits=orbits,                                  # MUST match injection
+        tdi_config="2nd generation",
+        force_backend=backend,
+        d_d=0.0,                                        # source-only return
+        tdi_type="XYZ",
     )
-    print(f"[run] chunked: n_chunks={len(chunked.geometry['starts'])}, "
-          f"T_chunk={chunked.T_chunk:.3e}s, alpha={chunked.tukey_alpha}, "
-          f"use_tukey={chunked.use_tukey}", flush=True)
+    print(f"[run] chunked: n_chunks={chunked.n_chunks}, "
+          f"T_chunk={chunked.T_chunk:.3e}s, "
+          f"alpha={chunked.resolved_tukey_alpha} "
+          f"(use_tukey={chunked.use_tukey})", flush=True)
 
     # --- prior (same as the lookup script) --------------------------------
     layer_df = wdm_set.layer_df
@@ -260,8 +282,11 @@ def main():
         # (3, Nf, Nt). For the full-band mismatch we have to mask the
         # template down to the active band to match the injection.
         template_full = np.zeros((3, Nf, Nt), dtype=float)
-        chunked.fill_global(
-            template_full, [tuple(params_i.tolist())], factors=None,
+        chunked.fill_global_wdm(
+            np.asarray(params_i, dtype=float).reshape(1, 9),
+            template_full,
+            convert_to_ra_dec=False,
+            factors=None,
         )
         # crop to the active band that matches the injection's WDMSettings
         tpl_active = template_full[
@@ -440,6 +465,8 @@ def main():
                 tslice = wdm_set.active_slice_t
                 data_d_full[:, ilo:ihi, tslice] = inj_active
                 invC_full  [:, ilo:ihi, tslice] = invC_active
+            # Wrap as the duck-type ``get_ll_wdm`` expects.
+            holder_full = _FullGridWDMHolder(data_d_full, invC_full)
 
             # lisatools' inner_product is 4 * differential_component *
             # sum(sig1.conj * sig2 / PSD); the chunked-het kernel just
@@ -468,9 +495,13 @@ def main():
             # target dlogL ~ 10/100/1000/10000 (quadratic scaling).
             alpha_cal = max(1.0 / max(snr, 1.0), 1e-3)
             p_cal = params_i + alpha_cal * pert_unit * direction
-            dh_cal, hh_cal = chunked.get_ll(
-                data_d_full, invC_full, [tuple(p_cal.tolist())],
+            chunked.get_ll_wdm(
+                np.asarray(p_cal, dtype=float).reshape(1, 9),
+                holder_full,
+                convert_to_ra_dec=False,
             )
+            dh_cal = chunked.d_h_out
+            hh_cal = chunked.h_h_out
             ll_cal = (ll_scale * float(dh_cal[0] - 0.5 * hh_cal[0])
                        - 0.5 * d_d)
             dll_cal = abs(ll_cal)  # vs injection ll=0
@@ -499,9 +530,13 @@ def main():
                         print(f"     [warn] lisatools logL failed at "
                               f"alpha={alpha:.3e}: {e}", flush=True)
                         continue
-                    dh_cpp, hh_cpp = chunked.get_ll(
-                        data_d_full, invC_full, [tuple(p.tolist())],
+                    chunked.get_ll_wdm(
+                        np.asarray(p, dtype=float).reshape(1, 9),
+                        holder_full,
+                        convert_to_ra_dec=False,
                     )
+                    dh_cpp = chunked.d_h_out
+                    hh_cpp = chunked.h_h_out
                     dh_cpp_lt = ll_scale * float(dh_cpp[0])
                     hh_cpp_lt = ll_scale * float(hh_cpp[0])
                     ll_cpp = -0.5 * (d_d + hh_cpp_lt - 2.0 * dh_cpp_lt)

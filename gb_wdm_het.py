@@ -43,6 +43,7 @@ from check_shortened_wdm import (
 from lisatools.detector import EqualArmlengthOrbits
 from lisatools.domains import FDSettings, FDSignal, WDMSettings
 from fastlisaresponse.tdiconfig import TDIConfig
+from fastlisaresponse.utils.parallelbase import FastLISAResponseParallelModule
 
 
 # ---------------------------------------------------------------------------
@@ -401,8 +402,16 @@ def chunked_het_grid_dim(
 # Main wrapper class
 # ---------------------------------------------------------------------------
 
-class GBWDMHeterodyne:
+class GBWDMHeterodyne(FastLISAResponseParallelModule):
     """High-level Python entry point for the chunked-heterodyne WDM GB kernels.
+
+    Inherits :class:`FastLISAResponseParallelModule`, so the compute
+    backend (``"cpu"`` / ``"cuda11x"`` / ``"cuda12x"`` / ``"cuda13x"`` /
+    ``"jax"``) is chosen at instantiation via ``force_backend`` and
+    all subsequent dispatch reads ``self.backend`` / ``self.backend.xp``
+    / ``self.backend.name``. Methods MUST NOT accept a ``backend=`` or
+    ``use_cpp=`` runtime kwarg (per the sprint-wide rule in
+    ``CLAUDE.md``); construct a fresh instance to switch backends.
 
     Constructor sets up the WDM grid, chunk geometry, phitilde window,
     and a cached :class:`CachedHeterodyneGenerator`. Methods
@@ -422,12 +431,21 @@ class GBWDMHeterodyne:
             (default) to auto-pick.
         use_tukey: if False, force alpha = 0.
         nchannels: 3 for XYZ.
-        backend: ``"cpu"``, ``"cuda12x"``, etc.
-        use_cpp: if True (default), route ``fill_global`` / ``get_ll``
-            / ``swap_ll`` through the C++ chunked-het kernels
-            (``GBComputationGroupWrap.gb_wdm_het_*`` for GB, or the
-            SOBBH analogue). Set False to use the pure-Python fallback
-            (useful for debugging / cross-validation).
+        force_backend: forwarded to :class:`FastLISAResponseParallelModule`.
+            Accepts ``"cpu"`` / ``"cuda11x"`` / ``"cuda12x"`` /
+            ``"cuda13x"`` / ``"jax"`` (or a full backend tuple). The
+            resulting ``self.backend`` drives both the C++/CUDA
+            template-kernel path (CPU/CUDA backends) and the JAX
+            autograd path (``"jax"`` backend).
+        tdi_gen: TDI generation string passed through to the GB source.
+        orbits: lisatools Orbits subclass; auto-defaults to
+            EqualArmlengthOrbits on the same backend if None.
+        t_obs_start: absolute time at which the WDM grid starts.
+        N_cp_sig, N_cp_orbit: source-signal / orbit spline cache
+            density (see kernel docstrings for the validated values).
+        jax_chunk: default leaf-axis chunk size for JAX dispatch
+            (memory escape hatch; ``None`` resolves via env at call
+            time).
     """
 
     # Subclass-overridable config: which C++ Wrap class on the backend
@@ -442,13 +460,31 @@ class GBWDMHeterodyne:
     def __init__(self, Nf, Nt, dt, T_full, t_ref_full,
                  Nt_sub=256, n_pad=32, N_sparse=256,
                  tukey_alpha=USE_RECOMMENDED_TUKEY, use_tukey=True,
-                 nchannels=3, backend="cpu",
+                 nchannels=3, force_backend=None,
                  tdi_gen="2nd generation",
                  orbits=None,
                  t_obs_start=0.0,
-                 use_cpp=True,
                  N_cp_sig=0,
-                 N_cp_orbit=0):
+                 N_cp_orbit=0,
+                 d_d=0.0,
+                 jax_chunk=None):
+        # Resolve the backend object up front so all nested
+        # constructors share the same backend string.
+        super().__init__(force_backend=force_backend)
+        # ``backend_short`` is the trailing tag of the resolved backend
+        # name (``cpu``, ``cuda12x``, ``jax``) -- the form lisatools /
+        # gbgpu / fastlisaresponse constructors accept as
+        # ``force_backend=...``.
+        self._backend_short = self.backend.name.split("_")[-1]
+        # jax_chunk:
+        #   Default leaf-axis chunk size for the JAX paths
+        #   (get_ll_jax / get_ll_grad_jax / hessian and their *_wdm
+        #   ACA wrappers). ``None`` -> resolve at call time via
+        #   _resolve_jax_chunk (env GBHET_JAX_CHUNK / JAX_GRAD_CHUNK,
+        #   else 0 = single big batched call). C++ paths are
+        #   unchunked -- the kernel's per-source loop limits CPU
+        #   throughput regardless of batch size.
+        self.jax_chunk = jax_chunk if jax_chunk is None else int(jax_chunk)
         # N_cp_sig:
         #   0  -> direct path (call get_tdi at all N_sparse points).
         #         Bit-precision match to the Python reference; default.
@@ -490,7 +526,13 @@ class GBWDMHeterodyne:
         self.tukey_alpha = float(tukey_alpha)
         self.use_tukey   = bool(use_tukey)
         self.nchannels = int(nchannels)
-        self.backend   = backend
+        # ``d_d`` constant the source-side ``get_ll`` adds to
+        # ``h_h - 2 d_h``. Defaults to 0 (constructor kwarg) so the
+        # returned log-likelihood is the source-only piece; callers
+        # add ``-0.5 <d|d>`` themselves if they want the full
+        # ``log p(d|h)``. Mirrors the same convention as
+        # :class:`fastlisaresponse.gbcomps.GBWDMComputations`.
+        self.d_d = float(d_d)
 
         self.T_chunk    = self.Nf * self.Nt_sub * self.dt
         self.chunk_df   = 1.0 / self.T_chunk
@@ -503,7 +545,7 @@ class GBWDMHeterodyne:
 
         self.geometry = compute_chunk_geometry(self.Nt, self.Nt_sub, self.n_pad)
         self.wdm_window = compute_wdm_window(self.Nf, self.Nt_sub, self.dt,
-                                             backend=backend)
+                                             backend=self._backend_short)
 
         # Cached heterodyne generator, reused across all binaries and chunks.
         # If the caller didn't supply orbits, default to EqualArmlength
@@ -511,10 +553,10 @@ class GBWDMHeterodyne:
         # the injection's orbit model (e.g. ESAOrbits) MUST be passed
         # here too or the template won't match.
         if orbits is None:
-            orbits = EqualArmlengthOrbits(force_backend=backend)
+            orbits = EqualArmlengthOrbits(force_backend=self._backend_short)
         self._gb_kwargs = dict(
             tdi_config=TDIConfig(tdi_gen), orbits=orbits,
-            tdi_chan="XYZ", force_backend=backend,
+            tdi_chan="XYZ", force_backend=self._backend_short,
         )
         self._gen = CachedHeterodyneGenerator(
             T_window=self.T_chunk, t_ref_source=self.t_ref_full,
@@ -524,18 +566,29 @@ class GBWDMHeterodyne:
 
         # FD/WDM settings reused per chunk.
         self._chunk_fd_set  = FDSettings(self.n_rfft_chunk, self.chunk_df,
-                                         force_backend=backend)
+                                         force_backend=self._backend_short)
         self._chunk_wdm_set = WDMSettings(Nf=self.Nf, Nt=self.Nt_sub,
-                                          dt=self.dt, force_backend=backend)
+                                          dt=self.dt,
+                                          force_backend=self._backend_short)
 
-        # C++ chunked-het routing setup. Deferred until the first
+        # Native-kernel routing setup. Deferred until the first
         # fill_global / get_ll / swap_ll call (so callers can construct
         # GBWDMHeterodyne before orbits have been auto-configured by
-        # GBTDIonTheFly).
-        self.use_cpp = bool(use_cpp)
+        # GBTDIonTheFly). The chosen backend (``self.backend``) drives
+        # which path runs -- CPU/CUDA backends use the C++ kernel,
+        # the ``"jax"`` backend uses the JAX kernel.
         self._cpp_setup_done = False
         self._cpp_orbits_obj = orbits
         self._cpp_tdi_gen = tdi_gen
+
+    @property
+    def _uses_cpp_kernel(self) -> bool:
+        """True when ``self.backend`` is a C++ backend (cpu/cuda*)
+        rather than the JAX backend. Used internally to dispatch
+        between the C++ and JAX implementations -- callers never need
+        to pass a ``backend=`` kwarg.
+        """
+        return self.backend.name != "fastlisaresponse_jax"
 
     # ------------------------------------------------------------------
     # C++ chunked-het routing
@@ -550,15 +603,18 @@ class GBWDMHeterodyne:
     def _setup_cpp(self, orbits, tdi_gen):
         """Construct the C++ Wrap objects and precompute geometry arrays.
 
-        Called lazily on first fill_global / get_ll / swap_ll call when
-        ``use_cpp=True``. The ``GBComputationGroupWrap`` /
-        ``SOBBHComputationGroupWrap`` is instantiated here, so callers
-        that pass ``use_cpp=False`` can run on systems where the C++
-        extension isn't importable. Orbits must be configured by this
-        point (typically done implicitly by GBTDIonTheFly's first use).
+        Called lazily on the first ``fill_global`` / ``get_ll`` /
+        ``swap_ll`` call when ``self.backend`` is one of the C++
+        backends (``cpu`` / ``cuda*``). Uses the inherited
+        :class:`FastLISAResponseParallelModule` ``self.backend`` --
+        the ``GBComputationGroupWrap`` / ``SOBBHComputationGroupWrap``
+        classes live on it. Orbits must be configured by this point
+        (typically done implicitly by GBTDIonTheFly's first use).
         """
-        from fastlisaresponse import get_backend
-        self._be = get_backend(self.backend)
+        # ``self.backend`` is the resolved FastLISAResponseBackend
+        # object (CPU / CUDA variant); kept as ``self._be`` as an alias
+        # so the rest of the class keeps the short name.
+        self._be = self.backend
         wrap_cls = getattr(self._be, self._CPP_WRAP_ATTR)
         self._cpp_group = wrap_cls()
 
@@ -774,7 +830,7 @@ class GBWDMHeterodyne:
             factors = np.ones(num_bin, dtype=float)
         factors = np.asarray(factors, dtype=float).copy()
 
-        if self.use_cpp:
+        if self._uses_cpp_kernel:
             self._ensure_cpp_setup()
             params_flat, n_check = self._flatten_params(params_list)
             assert n_check == num_bin
@@ -787,9 +843,33 @@ class GBWDMHeterodyne:
         return template_out
 
     def get_ll(self, data_d, invC, params_list, grid_dim=0,
-                use_layer_groups=False, margin_layers=0,
-                group_band_layers=5):
-        """Per-binary ``<d|h>`` / ``<h|h>`` via chunked heterodyne.
+                use_layer_groups=True, margin_layers=0,
+                group_band_layers=5, phase_maximize=True, return_cupy: bool = False):
+        """Per-binary log-likelihood via chunked heterodyne.
+
+        Computes ``-0.5 * (self.d_d + h_h - 2 d_h)`` after running the
+        chunked-het kernel (or its Python fallback). With ``self.d_d
+        = 0`` (the default), the return is the source-only
+        log-likelihood piece; the caller is responsible for adding
+        the global ``-0.5 <d|d>`` constant if they want the full
+        ``log p(d|h)``. The raw per-source inner products are stashed
+        on ``self.d_h`` / ``self.h_h`` for later access.
+
+        ``phase_maximize=True`` (default) marginalises analytically
+        over the source phase by replacing ``d_h`` with ``|d_h|``
+        before forming the likelihood; the pre-marg complex/signed
+        ``d_h`` is preserved on ``self.non_marg_d_h``.
+
+        The default ``use_layer_groups=True`` restricts both template
+        construction and the inner-product accumulator to a narrow
+        ``group_band_layers``-wide m-band around each source's carrier
+        layer. This is the canonical **narrow-band GB inner product**
+        validated against mm5 / mm2 (median mm5 ~1e-9; see
+        ``gb_chunked_prior_draws.py`` and the sprint root CLAUDE.md).
+        Setting ``use_layer_groups=False`` enables the full-Nf path,
+        which picks up spectral-tail contributions outside the GB band
+        and is *not* the right physical model for narrow-band GBs --
+        edge effects create large divergences from mm5.
 
         Args:
             data_d: ``(nchannels, Nf, Nt)`` WDM data.
@@ -797,20 +877,27 @@ class GBWDMHeterodyne:
                 same grid.
             params_list: iterable of length-nparams source-parameter vectors.
             grid_dim: CUDA launch grid size (use 0 for n_chunks).
-            use_layer_groups: if True, sort binaries by carrier WDM layer
-                and have the kernel iterate only the relevant m-band per
-                group instead of all Nf layers. Cuts data_d / invC
-                global-mem traffic by ~Nf/group_band_layers.
+            use_layer_groups: if True (default), sort binaries by
+                carrier WDM layer and iterate only the per-group
+                m-band. ~Nf/group_band_layers reduction in data_d /
+                invC traffic.
             margin_layers: extend each group's iterated m-band by this
                 many layers on each side (Doppler / wavelet-tail margin).
-            group_band_layers: max m-layer span per group (default 5).
+            group_band_layers: max m-layer span per group. Default 5
+                matches the mm5 narrow band ``[f0-3*df, f0+2*df]``.
+            phase_maximize: if True (default), analytically marginalise
+                the source phase by taking ``|d_h|`` before forming
+                the likelihood.
+            return_cupy: if True, leave the return on the GPU (cupy
+                array); default False = move to host (numpy).
 
         Returns:
-            (d_h, h_h) -- numpy arrays of length ``len(params_list)``.
+            ``like_out`` -- length ``len(params_list)`` array of the
+            per-source log-likelihood ``-0.5 * (d_d + h_h - 2 d_h)``.
         """
         num_bin = len(params_list)
 
-        if self.use_cpp:
+        if self._uses_cpp_kernel:
             self._ensure_cpp_setup()
             d_h = np.zeros(num_bin, dtype=float)
             h_h = np.zeros(num_bin, dtype=float)
@@ -829,29 +916,59 @@ class GBWDMHeterodyne:
                                   np.asarray(invC, dtype=float),
                                   params_flat, num_bin, grid_dim,
                                   groups=groups)
-            return d_h, h_h
 
-        # Pure-Python fallback: build the stitched template per binary
-        # and form the inner products directly. Matches the C++ kernel's
-        # accumulator loop (sum over keep regions only).
-        d_h = np.zeros(num_bin, dtype=float)
-        h_h = np.zeros(num_bin, dtype=float)
-        data_d = np.asarray(data_d)
-        invC   = np.asarray(invC)
-        for i, p in enumerate(params_list):
-            w = self._stitched_wdm(p)
-            d_h[i] = float(np.sum(data_d * w * invC))
-            h_h[i] = float(np.sum(w * w * invC))
-        return d_h, h_h
+        else:
+            # Pure-Python fallback: build the stitched template per binary
+            # and form the inner products directly. Matches the C++ kernel's
+            # accumulator loop (sum over keep regions only).
+            d_h = np.zeros(num_bin, dtype=float)
+            h_h = np.zeros(num_bin, dtype=float)
+            data_d = np.asarray(data_d)
+            invC   = np.asarray(invC)
+            for i, p in enumerate(params_list):
+                w = self._stitched_wdm(p)
+                d_h[i] = float(np.sum(data_d * w * invC))
+                h_h[i] = float(np.sum(w * w * invC))
+        
+        if phase_maximize:
+            self.non_marg_d_h = d_h.copy()
+            try:
+                self.non_marg_d_h = self.non_marg_d_h.get()
+            except AttributeError:
+                pass
+
+            d_h = self.xp.abs(d_h)
+
+        # store these likelihood terms for later if needed
+        self.h_h = h_h
+        self.d_h = d_h
+
+        # compute Likelihood
+        like_out = -1.0 / 2.0 * (self.d_d + h_h - 2 * d_h).real
+
+        if return_cupy:
+            return like_out
+
+        # back to CPU if on GPU
+        try:
+            return like_out.get()
+
+        except AttributeError:
+            return like_out
+
 
     def swap_ll(self, data_d, invC, params_add_list, params_remove_list,
                 grid_dim=0,
-                use_layer_groups=False, margin_layers=0,
+                use_layer_groups=True, margin_layers=0,
                 group_band_layers=5):
         """5-way swap-ll accumulator.
 
         Returns ``(d_h_add, d_h_remove, add_add, remove_remove,
         add_remove)`` -- each length ``num_bin``.
+
+        Default ``use_layer_groups=True`` matches the narrow-band GB
+        inner product validated against mm5 / mm2; see
+        :meth:`get_ll` for the rationale.
 
         Layer-grouping (``use_layer_groups=True``): the (add, remove) pair
         index ``bin_i`` is grouped by the carrier WDM layer derived from
@@ -866,7 +983,7 @@ class GBWDMHeterodyne:
         d_h_add = np.zeros(num_bin); d_h_rem = np.zeros(num_bin)
         aa = np.zeros(num_bin); rr = np.zeros(num_bin); ar = np.zeros(num_bin)
 
-        if self.use_cpp:
+        if self._uses_cpp_kernel:
             self._ensure_cpp_setup()
             pa, _ = self._flatten_params(params_add_list)
             pr, _ = self._flatten_params(params_remove_list)
@@ -1040,6 +1157,709 @@ class GBWDMHeterodyne:
             grad_aa=g_aa, grad_rr=g_rr, grad_ar=g_ar,
             grad_L_add=grad_L_add,
         )
+
+    # ------------------------------------------------------------------
+    # JAX backend (autograd-friendly likelihood / gradient / Hessian)
+    #
+    # The C++ get_ll / get_ll_grad above remain the canonical path; the
+    # JAX methods below mirror them by calling the same chunked-het
+    # primitives in fastlisaresponse.jax.wdm.heterodyne_kernels. They
+    # share the C++-built chunk geometry / WDM window arrays via
+    # _ensure_cpp_setup so the two backends are guaranteed to consume
+    # the same geometry (any drift would surface as a JAX-vs-C++
+    # reldiff in validate_jax_vs_cpp_chunked_het.py).
+    # ------------------------------------------------------------------
+
+    # Subclass-overridable JAX source factory: () -> JaxAmpPhaseSource
+    # built from this instance. GB uses JaxUCBSource; SOBBH would point
+    # to its own JAX source class via this hook.
+    _JAX_SOURCE_CLASS_PATH = ("fastlisaresponse.jax.sources.ucb", "JaxUCBSource")
+
+    def _ensure_jax_setup(self):
+        if getattr(self, "_jax_setup_done", False):
+            return
+        self._ensure_cpp_setup()  # need cpp-side chunk arrays
+        # Resolve the JAX backend's ``xp`` module through fastlisaresponse's
+        # backend manager rather than importing ``jax.numpy`` directly --
+        # keeps the chunked-het JAX path consistent with the rest of the
+        # sprint's backend-dispatch convention (see CLAUDE.md). Cached as
+        # ``self.jax_xp`` so callers (e.g. gb_chunked_test_script.py) can
+        # build JAX-side wrappers without a top-level ``import jax.numpy``.
+        try:
+            from fastlisaresponse import get_backend as _get_be
+            self._jax_backend = _get_be("fastlisaresponse_jax")
+            jnp = self._jax_backend.xp
+        except Exception as e:
+            # Fallback to direct jax.numpy import (still functional --
+            # the backend lookup only fails if fastlisaresponse_jax isn't
+            # registered, which means jax isn't installed either).
+            try:
+                import jax.numpy as jnp
+                self._jax_backend = None
+            except ImportError as e2:
+                raise RuntimeError(
+                    "JAX is not installed; install jax to use the *_jax methods."
+                ) from e2
+        self._jax_xp = jnp
+        from importlib import import_module
+        from fastlisaresponse.jax.orbits import OrbitsWrapJAX
+        from fastlisaresponse.jax.tdi_config import TDIConfigWrapJAX
+        src_mod = import_module(self._JAX_SOURCE_CLASS_PATH[0])
+        SrcCls   = getattr(src_mod, self._JAX_SOURCE_CLASS_PATH[1])
+        self._jax_orbits = OrbitsWrapJAX(*self._orbits_py.pycppdetector_args)
+        self._jax_tdi    = TDIConfigWrapJAX(*self._tdi_cfg_py.pytdiconfig_args)
+        self._jax_source = SrcCls(t_ref=self.t_ref_full)
+        self._jax_chunk_t_starts = jnp.asarray(self._cpp_chunk_t_starts)
+        self._jax_chunk_keep_lo  = jnp.asarray(self._cpp_chunk_keep_lo)
+        self._jax_chunk_keep_hi  = jnp.asarray(self._cpp_chunk_keep_hi)
+        self._jax_chunk_n_lo     = jnp.asarray(self._cpp_chunk_n_global_offset)
+        self._jax_wdm_window     = jnp.asarray(self._cpp_wdm_window)
+        self._jax_setup_done = True
+
+    @property
+    def jax_xp(self):
+        """JAX numpy module (``jax.numpy``), resolved via the
+        ``fastlisaresponse_jax`` backend. Lazy: triggers ``_ensure_jax_setup``
+        on first access.
+        """
+        self._ensure_jax_setup()
+        return self._jax_xp
+
+    def _jax_native_group(self):
+        """Return the JAX backend's ``GBComputationGroupWrap()`` --
+        the per-source-class chunked-het kernel wrap that exposes
+        ``gb_wdm_het_get_ll`` / ``gb_wdm_het_swap_ll`` /
+        ``gb_wdm_het_fill_global`` / ``gb_wdm_het_get_ll_grad`` /
+        ``gb_wdm_het_hessian`` as methods. Lazy-resolves through
+        ``self._jax_backend`` (the ``fastlisaresponse_jax`` backend
+        object) -- no direct imports of the standalone JAX functions.
+        Cached as ``self._jax_group``.
+        """
+        if getattr(self, "_jax_group", None) is not None:
+            return self._jax_group
+        self._ensure_jax_setup()
+        if self._jax_backend is None:
+            # The backend lookup failed at setup time; fall back to
+            # constructing the wrap directly from the JAX submodule
+            # so the methods still work even without the backend
+            # registry. This path is exercised only when
+            # ``fastlisaresponse_jax`` is unavailable in the registry
+            # but ``jax`` is importable.
+            from fastlisaresponse.jax.wdm import GBComputationGroupWrapJAX
+            self._jax_group = GBComputationGroupWrapJAX()
+        else:
+            wrap_cls = getattr(self._jax_backend, self._CPP_WRAP_ATTR)
+            self._jax_group = wrap_cls()
+        return self._jax_group
+
+    def _jax_kernel_args(self, data_d, invC):
+        """Return the (positional, keyword) tuple consumed by every
+        gb_wdm_het_*_jax kernel. ``data_d`` / ``invC`` are converted to
+        jnp arrays here so callers don't have to.
+        """
+        import jax.numpy as jnp
+        self._ensure_jax_setup()
+        pos = (
+            jnp.asarray(data_d), jnp.asarray(invC),
+            self._jax_chunk_t_starts,
+            self._jax_chunk_keep_lo, self._jax_chunk_keep_hi,
+            self._jax_chunk_n_lo,
+            self._jax_source, self._jax_orbits, self._jax_tdi,
+            self._jax_wdm_window,
+        )
+        kw = dict(
+            Nf=self.Nf, Nt=self.Nt, Nt_sub=self.Nt_sub, N_sparse=self.N_sparse,
+            dt=self.dt, T_chunk=self.T_chunk,
+            tukey_alpha=self._cpp_tukey_alpha,
+        )
+        return pos, kw
+
+    def _resolve_jax_chunk(self, chunk):
+        """Pick the effective leaf-axis chunk size for a JAX call.
+
+        Priority: explicit ``chunk`` arg > instance default
+        ``self.jax_chunk`` > env ``GBHET_JAX_CHUNK`` /
+        ``JAX_GRAD_CHUNK`` (legacy). Returns ``0`` if no chunking is
+        requested (single big batched call).
+
+        Rationale: the C++ kernel's per-source loop limits per-call
+        throughput on CPU regardless of batch size, so we only
+        plumbed batch chunking through the JAX paths -- where the
+        knob is mostly a memory escape hatch (jax.grad / jax.hessian
+        autograd tapes blow up with the binary axis).
+        """
+        import os
+        if chunk is not None:
+            return int(chunk)
+        # instance-level default, set at construction
+        inst = getattr(self, "jax_chunk", 0)
+        if inst:
+            return int(inst)
+        # env fallbacks (GBHET_JAX_CHUNK preferred; JAX_GRAD_CHUNK kept
+        # for back-compat with earlier scripts)
+        env = os.environ.get("GBHET_JAX_CHUNK") or os.environ.get("JAX_GRAD_CHUNK")
+        return int(env) if env else 0
+
+    def _chunked_jax_apply(self, fn, params_batch, chunk):
+        """Apply ``fn(p_chunk)`` over ``params_batch`` split into
+        leaf-axis chunks of size ``chunk`` (None / 0 / negative
+        disables chunking). ``fn`` must return either a single ndarray
+        ``(K, ...)`` or a tuple/list of such ndarrays. Outputs are
+        concatenated along axis 0.
+
+        Recompiles JAX once per distinct chunk shape -- callers should
+        pick a chunk size that divides ``num_bin`` exactly (or accept a
+        recompile on the partial tail chunk).
+        """
+        import numpy as _np
+        num_bin = params_batch.shape[0]
+        if not chunk or chunk <= 0 or chunk >= num_bin:
+            return fn(params_batch)
+        outs = []
+        for start in range(0, num_bin, chunk):
+            end = min(start + chunk, num_bin)
+            out = fn(params_batch[start:end])
+            outs.append(out)
+        if isinstance(outs[0], tuple) or isinstance(outs[0], list):
+            return tuple(
+                _np.concatenate([_np.asarray(o[k]) for o in outs], axis=0)
+                for k in range(len(outs[0]))
+            )
+        return _np.concatenate([_np.asarray(o) for o in outs], axis=0)
+
+    def get_ll_jax(self, params_batch, data_d, invC, chunk=None):
+        """JAX-backed ``<d|h>``, ``<h|h>`` per binary.
+
+        Returns numpy arrays of length ``num_bin`` (so the call shape
+        matches :meth:`get_ll`).
+
+        ``chunk`` (or env ``GBHET_JAX_CHUNK`` / ``JAX_GRAD_CHUNK``):
+        split the leaf axis into groups of this size before each JAX
+        call -- mirrors the same knob on :meth:`get_ll_grad_jax` and
+        :meth:`hessian`. Useful when the kernel's per-call memory
+        scales linearly with ``num_bin`` and the full batch doesn't
+        fit. ``None`` -> resolved per :meth:`_resolve_jax_chunk`.
+        """
+        import jax.numpy as jnp
+        # All JAX chunked-het kernel functions are accessed through the
+        # JAX backend's ``GBComputationGroupWrap`` (gb_wdm_het_*
+        # methods registered on :class:`GBComputationGroupWrapJAX`).
+        jax_group = self._jax_native_group()
+        pos, kw = self._jax_kernel_args(data_d, invC)
+        p_full = jnp.asarray(np.asarray(params_batch).reshape(-1, self._CPP_NPARAMS))
+        chunk_eff = self._resolve_jax_chunk(chunk)
+        def _fn(p_sub):
+            d_h, h_h = jax_group.gb_wdm_het_get_ll(p_sub, *pos, **kw)
+            return (np.asarray(d_h), np.asarray(h_h))
+        return self._chunked_jax_apply(_fn, p_full, chunk_eff)
+
+    def get_ll_grad_jax(self, params_batch, data_d, invC, chunk=None):
+        """JAX-autograd gradient of L = sum_i (<d|h_i> - 0.5 <h_i|h_i>)
+        w.r.t. ``params_batch``. Returns ``(num_bin, nparams)`` numpy.
+
+        ``chunk`` (or env ``GBHET_JAX_CHUNK`` / ``JAX_GRAD_CHUNK``):
+        split the leaf axis into groups of this size before calling
+        jax.grad (memory escape hatch). ``None`` -> resolved per
+        :meth:`_resolve_jax_chunk`.
+        """
+        import jax.numpy as jnp
+        jax_group = self._jax_native_group()
+        pos, kw = self._jax_kernel_args(data_d, invC)
+        p_full = jnp.asarray(np.asarray(params_batch).reshape(-1, self._CPP_NPARAMS))
+        chunk_eff = self._resolve_jax_chunk(chunk)
+        def _fn(p_sub):
+            g = jax_group.gb_wdm_het_get_ll_grad(p_sub, *pos, **kw)
+            return np.asarray(g)
+        return self._chunked_jax_apply(_fn, p_full, chunk_eff)
+
+    def hessian(self, params_batch, data_d, invC,
+                chunk=None, psd_fix=False, psd_floor_rel=1e-30):
+        """Per-binary Hessian of L = <d|h> - 0.5 <h|h> w.r.t. params.
+
+        Returns ``(num_bin, nparams, nparams)``.
+
+        JAX-autograd only -- requires a JAX-backend instance. The
+        instance's backend is fixed at construction (no ``backend=``
+        kwarg); construct ``GBWDMHeterodyne(force_backend="jax", ...)``
+        to use this method, or accept the NotImplementedError on a
+        C++ backend until the Stage-2 native Hessian kernel lands.
+
+        Args:
+            params_batch: ``(num_bin, nparams)`` ndarray.
+            data_d, invC: same shape contract as :meth:`get_ll`.
+            chunk: leaf-axis chunking for memory; falls back to the env
+                ``JAX_GRAD_CHUNK`` (same knob as get_ll_grad_jax).
+            psd_fix: if True, apply eigendecompose + ``|lambda|`` clip
+                (floor ``psd_floor_rel * lambda_max``) to ``-H`` so the
+                returned matrix is positive-definite. This is the
+                M = -H = inverse-covariance form -- ready to feed into
+                ``NUTSSampler(metric=...)`` as a mass matrix.
+        """
+        if self._uses_cpp_kernel:
+            raise NotImplementedError(
+                "hessian requires a JAX backend "
+                "(GBWDMHeterodyne(force_backend='jax')); the C++/CUDA "
+                "Hessian kernel is the Stage-2 follow-up."
+            )
+        import os
+        import jax.numpy as jnp
+        jax_group = self._jax_native_group()
+        pos, kw = self._jax_kernel_args(data_d, invC)
+        p_full = jnp.asarray(np.asarray(params_batch).reshape(-1, self._CPP_NPARAMS))
+        if chunk is None:
+            chunk = int(os.environ.get("JAX_GRAD_CHUNK", "0"))
+        def _fn(p_sub):
+            H = jax_group.gb_wdm_het_hessian(p_sub, *pos, **kw)
+            return np.asarray(H)
+        H = self._chunked_jax_apply(_fn, p_full, chunk)
+        if psd_fix:
+            H = psd_fix_eigabs(-H, floor_rel=psd_floor_rel)
+        return H
+
+    # ------------------------------------------------------------------
+    # ACA-aware wrappers (mirror GBWDMComputations.*_wdm signatures)
+    #
+    # Drop-in surface so this class can replace the legacy
+    # GBWDMComputations in the global-fit Buffer / WDMBandLikelihoodEngine
+    # path. Each ``*_wdm`` accepts ``source`` as one of:
+    #
+    #   - tuple ``(data_d, invC)`` of global-grid ``(nchannels, Nf, Nt)``
+    #     ndarrays. Used directly.
+    #   - :class:`AnalysisContainer` (single source). ``arr`` is taken
+    #     verbatim; PSD inverted with the sanitiser below.
+    #   - :class:`AnalysisContainerArray` (multi-band buffer, legacy
+    #     ``wdm_holder``). The per-band slabs are zero-padded into the
+    #     global ``(nchannels, Nf, Nt)`` grid via ``ind_min_f`` /
+    #     ``ind_min_t`` offsets read off the basis settings; one global
+    #     buffer is built per unique ``data_index`` and reused for all
+    #     sources binding to that band.
+    #
+    # Inner products / gradients / Hessians are then routed through the
+    # existing array-based methods (``get_ll`` / ``get_ll_grad_jax`` /
+    # ``hessian``) per unique data_index group, and outputs are
+    # reassembled into the original source ordering.
+    # ------------------------------------------------------------------
+
+    # Default per-parameter FD step (used by get_ll_grad_wdm when caller
+    # doesn't pass param_eps). Sized for GB params at the natural
+    # chunked-het scales -- NOT the legacy ``GBWDMComputations`` table,
+    # which assumed the lookup-table kernel's normalisation.
+    #
+    # Heuristic: pick eps small enough that the kernel-side FD truncation
+    # error is small, but large enough to stay well above the FP noise
+    # floor of the get_ll inner-product accumulator (~1e-12 of |L|).
+    #
+    #   amp     ~ 1e-22  -> 1e-26      (amp * 1e-4; overridden in grad
+    #                                    by caller's amp-scaling if any)
+    #   f0      ~ 5e-3 Hz -> 1e-8 Hz   (fractional ~ 2e-6; big enough
+    #                                    that the carrier truly shifts a
+    #                                    measurable amount, small enough
+    #                                    that the heterodyne stays valid)
+    #   fdot    ~ 1e-17 - 1e-13 Hz/s -> 1e-14
+    #   fddot   frozen (0.0)
+    #   angles  ~ rad   -> 1e-3
+    _DEFAULT_PARAM_EPS = (
+        1.0e-26,   # amp     (absolute; ~ amp * 1e-4 for amp ~ 1e-22)
+        1.0e-8,    # f0      (Hz)
+        1.0e-14,   # fdot    (Hz/s)
+        0.0,       # fddot   (frozen)
+        1.0e-3,    # phi0
+        1.0e-3,    # inc
+        1.0e-3,    # psi
+        1.0e-3,    # lam
+        1.0e-3,    # beta
+    )
+
+    @staticmethod
+    def _invert_psd(psd):
+        """Sanitised 1/psd: non-finite / nonpositive entries -> 0
+        (so the corresponding inner-product cell drops out cleanly).
+        """
+        with np.errstate(divide="ignore", invalid="ignore"):
+            inv = 1.0 / np.where(
+                np.isfinite(psd) & (psd > 0), psd, np.inf,
+            )
+        return np.where(np.isfinite(inv), inv, 0.0)
+
+    @staticmethod
+    def _maybe_aca_basis(source):
+        """Return basis_settings (with ind_min_f / ind_max_f / Nf / Nt
+        attributes) on ``source`` if it's an AC/ACA, else None.
+        """
+        bs = getattr(source, "_basis_settings", None)
+        if bs is not None:
+            return bs
+        dr = getattr(source, "data_res_arr", None)
+        if dr is not None:
+            return getattr(dr, "settings", None)
+        return None
+
+    def _zero_pad_band_to_global(self, band_arr, basis_settings, is_psd):
+        """Zero-pad a per-band slab into a full ``(nchannels, Nf, Nt)``
+        ndarray sized to the chunked-het instance.
+
+        Handles two band-slab shapes seen in the wild:
+
+          - ``(nch, Nf_active, Nt_active)`` -- WDM domain proper. The
+            slab is placed at ``[ind_min_f : ind_max_f+1, slice_t]`` of
+            a fresh global grid; PSD inversion is applied here so the
+            returned ``invC`` slab is ``1/PSD``.
+          - ``(nch, nch, Nf_active, Nt_active)`` -- cross-channel PSD.
+            Diagonalised into per-channel ``(nch, Nf_active, Nt_active)``
+            before padding.
+        """
+        nch = self.nchannels
+        arr = np.asarray(band_arr)
+        if arr.ndim == 4:
+            arr = np.stack([arr[c, c] for c in range(nch)], axis=0)
+        assert arr.ndim == 3 and arr.shape[0] == nch, (
+            f"unexpected band slab shape {arr.shape}; expected "
+            f"({nch}, Nf_band, Nt_band) or ({nch}, {nch}, Nf_band, Nt_band)"
+        )
+        ilo = int(getattr(basis_settings, "ind_min_f", 0))
+        ihi = int(getattr(basis_settings, "ind_max_f", self.Nf - 1))
+        if hasattr(basis_settings, "active_slice_t") and getattr(
+            basis_settings, "Nt_active", self.Nt
+        ) != self.Nt:
+            tslice = basis_settings.active_slice_t
+        else:
+            tslice = slice(None)
+        out = np.zeros((nch, self.Nf, self.Nt), dtype=float)
+        out[:, ilo: ihi + 1, tslice] = self._invert_psd(arr) if is_psd else arr
+        return out
+
+    def _resolve_source_to_arrays(self, source, data_index=None, noise_index=None,
+                                   num_bin=None):
+        """Resolve ``source`` to ``{data_idx: (data_d_global, invC_global)}``
+        keyed by the unique ``data_index`` values present in this call.
+
+        For the array-tuple and AC cases there is exactly one entry (key
+        ``0``); for ACAs there is one entry per unique ``data_index``.
+        """
+        # 1) Raw tuple (data_d, invC) -- pass through.
+        if isinstance(source, (tuple, list)) and len(source) == 2 and not hasattr(source, "linear_data_arr"):
+            d, c = source
+            return {0: (np.asarray(d, dtype=float), np.asarray(c, dtype=float))}
+
+        # 2) AnalysisContainer -- single source.
+        if hasattr(source, "data_res_arr") and hasattr(source, "sens_mat") and not hasattr(source, "linear_data_arr"):
+            bs = self._maybe_aca_basis(source)
+            d = np.asarray(source.data_res_arr.arr, dtype=float)
+            psd = np.asarray(source.sens_mat.sens_mat, dtype=float)
+            if d.shape == (self.nchannels, self.Nf, self.Nt):
+                return {0: (d, self._invert_psd(psd if psd.ndim == 3 else np.stack(
+                    [psd[c, c] for c in range(self.nchannels)], axis=0
+                )))}
+            # Active-band slab -> zero-pad.
+            assert bs is not None, (
+                "AnalysisContainer with non-global data shape requires "
+                "basis_settings exposing ind_min_f / ind_max_f"
+            )
+            d_g = self._zero_pad_band_to_global(d, bs, is_psd=False)
+            c_g = self._zero_pad_band_to_global(psd, bs, is_psd=True)
+            return {0: (d_g, c_g)}
+
+        # 3) AnalysisContainerArray (legacy ``wdm_holder``).
+        if hasattr(source, "linear_data_arr") or hasattr(source, "data_shaped"):
+            if data_index is None:
+                if num_bin is None:
+                    raise ValueError("ACA source requires data_index (or num_bin)")
+                data_index = np.zeros(num_bin, dtype=np.int32)
+            data_index = np.asarray(data_index)
+            if noise_index is None:
+                noise_index = data_index
+            noise_index = np.asarray(noise_index)
+            data_shaped = np.asarray(source.data_shaped[0])
+            psd_shaped  = np.asarray(source.psd_shaped[0])
+            bs = self._maybe_aca_basis(source)
+            unique_data = np.unique(data_index)
+            out = {}
+            for di in unique_data:
+                ni = int(noise_index[np.argmax(data_index == di)])
+                d_band = data_shaped[int(di)]
+                c_band = psd_shaped[int(ni)]
+                if d_band.shape == (self.nchannels, self.Nf, self.Nt):
+                    d_g = d_band.astype(float, copy=False)
+                    c_g = self._invert_psd(
+                        c_band if c_band.ndim == 3 else
+                        np.stack([c_band[c, c] for c in range(self.nchannels)], axis=0)
+                    )
+                else:
+                    if bs is None:
+                        raise ValueError(
+                            "ACA source with per-band slab requires basis_settings "
+                            "exposing ind_min_f / ind_max_f"
+                        )
+                    d_g = self._zero_pad_band_to_global(d_band, bs, is_psd=False)
+                    c_g = self._zero_pad_band_to_global(c_band, bs, is_psd=True)
+                out[int(di)] = (d_g, c_g)
+            return out
+
+        raise TypeError(
+            f"unsupported source type {type(source).__name__}; expected "
+            "tuple/list (data_d, invC), AnalysisContainer, or "
+            "AnalysisContainerArray"
+        )
+
+    @staticmethod
+    def _maybe_ecl_to_icrs(params, convert_to_ra_dec):
+        if not convert_to_ra_dec:
+            return params
+        from fastlisaresponse.response import ecliptic_to_icrs
+        params = np.asarray(params, dtype=float).copy()
+        if params.ndim == 1:
+            params = params.reshape(1, -1)
+        lam = params[:, -2].copy()
+        beta = params[:, -1].copy()
+        lam, beta = ecliptic_to_icrs(lam, beta)
+        params[:, -2] = lam
+        params[:, -1] = beta
+        return params
+
+    def _dispatch_per_band(self, params, source, data_index, noise_index,
+                            convert_to_ra_dec, _fn):
+        """Common per-band loop for the ``*_wdm`` methods. ``_fn`` is a
+        callable ``(data_d, invC, params_band) -> per_source_output`` --
+        either an ndarray of shape ``(K, ...)`` or a tuple of such
+        ndarrays. The first axis is reassembled in the original source
+        ordering and returned.
+        """
+        params = np.asarray(params, dtype=float).reshape(-1, self._CPP_NPARAMS)
+        num_bin = params.shape[0]
+        params_used = self._maybe_ecl_to_icrs(params, convert_to_ra_dec)
+        resolved = self._resolve_source_to_arrays(
+            source, data_index=data_index, noise_index=noise_index,
+            num_bin=num_bin,
+        )
+        if data_index is None:
+            data_index = np.zeros(num_bin, dtype=np.int32)
+        data_index = np.asarray(data_index)
+
+        # Collect per-band outputs, then reassemble in original ordering.
+        gathered = None
+        for di, (d_g, c_g) in resolved.items():
+            mask = (data_index == di)
+            if not mask.any():
+                continue
+            params_band = params_used[mask]
+            out_band = _fn(d_g, c_g, params_band)
+            if isinstance(out_band, (tuple, list)):
+                if gathered is None:
+                    gathered = tuple(
+                        np.zeros((num_bin,) + np.asarray(o).shape[1:], dtype=float)
+                        for o in out_band
+                    )
+                for slot, o in zip(gathered, out_band):
+                    slot[mask] = np.asarray(o)
+            else:
+                o = np.asarray(out_band)
+                if gathered is None:
+                    gathered = np.zeros((num_bin,) + o.shape[1:], dtype=float)
+                gathered[mask] = o
+        if gathered is None:
+            raise RuntimeError("no sources dispatched (empty data_index?)")
+        return gathered
+
+    def get_ll_wdm(self, params, source, *,
+                   data_index=None, noise_index=None,
+                   convert_to_ra_dec=False, return_inner_products=False,
+                   chunk=None):
+        """ACA-aware ``<d|h>`` / ``<h|h>``. Drop-in for
+        :meth:`GBWDMComputations.get_ll_wdm`.
+
+        Dispatches via ``self.backend`` -- C++ kernel for cpu/cuda
+        backends, JAX kernel for the jax backend. No ``backend=`` kwarg
+        (per the sprint-wide rule); construct a different instance to
+        switch backends. ``chunk`` applies only to the JAX path; the
+        C++ path is unchunked.
+        """
+        if self._uses_cpp_kernel:
+            def _fn(d_g, c_g, params_band):
+                d_h, h_h = self.get_ll(
+                    d_g, c_g,
+                    [params_band[i] for i in range(params_band.shape[0])],
+                )
+                return (np.asarray(d_h), np.asarray(h_h))
+        else:
+            def _fn(d_g, c_g, params_band):
+                d_h, h_h = self.get_ll_jax(params_band, d_g, c_g, chunk=chunk)
+                return (np.asarray(d_h), np.asarray(h_h))
+        d_h, h_h = self._dispatch_per_band(
+            params, source, data_index, noise_index, convert_to_ra_dec, _fn,
+        )
+        self.d_h_out = d_h
+        self.h_h_out = h_h
+        like_out = -0.5 * (h_h - 2.0 * d_h)
+        if return_inner_products:
+            return like_out, d_h, h_h
+        return like_out
+
+    def get_ll_grad_wdm(self, params, source, *,
+                        param_eps=None,
+                        data_index=None, noise_index=None,
+                        convert_to_ra_dec=False,
+                        chunk=None):
+        """ACA-aware gradient of L = <d|h> - 0.5<h|h>.
+
+        Dispatches via ``self.backend``: cpu/cuda backends take the
+        central-FD path on :meth:`get_ll_grad` (FD over the C++
+        kernel); the jax backend uses :meth:`get_ll_grad_jax`
+        (autograd). No ``backend=`` kwarg (per the sprint-wide rule);
+        construct a different instance to switch backends.
+        Returns ``(num_bin, nparams)`` numpy.
+        """
+        if self._uses_cpp_kernel:
+            eps = (np.asarray(param_eps, dtype=float)
+                   if param_eps is not None else
+                   np.asarray(self._DEFAULT_PARAM_EPS, dtype=float))
+            def _fn(d_g, c_g, params_band):
+                return self.get_ll_grad(
+                    d_g, c_g, [params_band[i] for i in range(params_band.shape[0])],
+                    eps,
+                )
+        else:
+            def _fn(d_g, c_g, params_band):
+                return self.get_ll_grad_jax(params_band, d_g, c_g, chunk=chunk)
+        return self._dispatch_per_band(
+            params, source, data_index, noise_index, convert_to_ra_dec, _fn,
+        )
+
+    def hessian_wdm(self, params, source, *,
+                    data_index=None, noise_index=None,
+                    convert_to_ra_dec=False,
+                    chunk=None, psd_fix=False, psd_floor_rel=1e-30):
+        """ACA-aware per-binary Hessian of L = <d|h> - 0.5<h|h>.
+
+        Requires a JAX backend (autograd-only for now). Returns
+        ``(num_bin, nparams, nparams)`` numpy. When ``psd_fix=True``
+        returns ``M = |-H|`` (eigendecompose-then-abs) which is ready
+        to be fed to ``NUTSSampler(metric=M)`` as a per-leaf mass
+        matrix.
+        """
+        def _fn(d_g, c_g, params_band):
+            return self.hessian(
+                params_band, d_g, c_g,
+                chunk=chunk, psd_fix=psd_fix, psd_floor_rel=psd_floor_rel,
+            )
+        return self._dispatch_per_band(
+            params, source, data_index, noise_index, convert_to_ra_dec, _fn,
+        )
+
+    def get_swap_ll_wdm(self, params_add, params_remove, source, *,
+                        data_index=None, noise_index=None,
+                        convert_to_ra_dec=False, phase_marginalize=False):
+        """ACA-aware swap-LL pieces. Drop-in for
+        :meth:`GBWDMComputations.get_swap_ll_wdm`.
+
+        Stashes ``self.d_h_add_out`` / ``self.d_h_remove_out`` /
+        ``self.add_add_out`` / ``self.remove_remove_out`` /
+        ``self.add_remove_out`` for back-compat, and returns
+        ``(like_add, like_remove, d_h_add, d_h_remove, aa, rr, ar)`` in
+        the same shape contract as the legacy generator.
+
+        ``phase_marginalize=True`` is currently not supported by the
+        chunked-het kernel; we surface this loudly rather than silently
+        returning the un-maximised result.
+        """
+        if phase_marginalize:
+            raise NotImplementedError(
+                "GBWDMHeterodyne.get_swap_ll_wdm does not yet support "
+                "phase_marginalize=True. Use the gradient path "
+                "(get_ll_grad_wdm / hessian_wdm) which does not "
+                "phase-maximise, or fall back to the FD legacy "
+                "generator for RJ moves."
+            )
+        params_add    = np.asarray(params_add,    dtype=float).reshape(-1, self._CPP_NPARAMS)
+        params_remove = np.asarray(params_remove, dtype=float).reshape(-1, self._CPP_NPARAMS)
+        assert params_add.shape == params_remove.shape
+        num_bin = params_add.shape[0]
+        params_add_used    = self._maybe_ecl_to_icrs(params_add,    convert_to_ra_dec)
+        params_remove_used = self._maybe_ecl_to_icrs(params_remove, convert_to_ra_dec)
+
+        resolved = self._resolve_source_to_arrays(
+            source, data_index=data_index, noise_index=noise_index,
+            num_bin=num_bin,
+        )
+        if data_index is None:
+            data_index = np.zeros(num_bin, dtype=np.int32)
+        data_index = np.asarray(data_index)
+
+        d_h_add_out    = np.zeros(num_bin)
+        d_h_remove_out = np.zeros(num_bin)
+        aa_out         = np.zeros(num_bin)
+        rr_out         = np.zeros(num_bin)
+        ar_out         = np.zeros(num_bin)
+        for di, (d_g, c_g) in resolved.items():
+            mask = (data_index == di)
+            if not mask.any():
+                continue
+            pa = [params_add_used[i]    for i in np.flatnonzero(mask)]
+            pr = [params_remove_used[i] for i in np.flatnonzero(mask)]
+            d_h_a, d_h_r, aa, rr, ar = self.swap_ll(d_g, c_g, pa, pr)
+            d_h_add_out[mask]    = d_h_a
+            d_h_remove_out[mask] = d_h_r
+            aa_out[mask]         = aa
+            rr_out[mask]         = rr
+            ar_out[mask]         = ar
+
+        self.d_h_add_out      = d_h_add_out
+        self.d_h_remove_out   = d_h_remove_out
+        self.add_add_out      = aa_out
+        self.remove_remove_out = rr_out
+        self.add_remove_out   = ar_out
+        like_add    = -0.5 * (aa_out    - 2.0 * d_h_add_out)
+        like_remove = -0.5 * (rr_out    - 2.0 * d_h_remove_out)
+        return like_add, like_remove, d_h_add_out, d_h_remove_out, aa_out, rr_out, ar_out
+
+    def fill_global_wdm(self, params, templates, source, *,
+                        convert_to_ra_dec=False, data_index=None,
+                        factors=None):
+        """ACA-aware fill_global. Drop-in for
+        :meth:`GBWDMComputations.fill_global_wdm` (params first per the
+        sprint convention; 1D / 2D ``params`` are auto-promoted via
+        ``atleast_2d`` internally).
+
+        Forwards directly to :meth:`fill_global` -- the chunked-het
+        kernel already accepts ``(num_templates, nchannels, Nf, Nt)``
+        and ``data_index`` per source, so the only adapter work is to
+        normalise the params layout and apply the optional sky
+        transform.
+        """
+        params = np.atleast_2d(np.asarray(params, dtype=float)).reshape(-1, self._CPP_NPARAMS)
+        params_used = self._maybe_ecl_to_icrs(params, convert_to_ra_dec)
+        params_list = [params_used[i] for i in range(params_used.shape[0])]
+        # Note: ``source`` is unused for fill_global -- the legacy
+        # generator takes it to size the cpp_wdm holder, but chunked-het
+        # writes templates directly. We accept it in the signature for
+        # drop-in compatibility.
+        del source
+        self.fill_global(templates, params_list, factors=factors,
+                         data_index=data_index)
+
+
+def psd_fix_eigabs(M, floor_rel=1e-30):
+    """Project each ``(d, d)`` slice of ``M`` onto the PSD cone via
+    symmetric eigendecomposition with ``|lambda|`` clipping.
+
+    Args:
+        M: ``(..., d, d)`` ndarray. Must be (approximately) symmetric
+            along the last two axes; the routine symmetrises explicitly
+            (``0.5 * (M + M^T)``) before decomposing.
+        floor_rel: floor on eigenvalues as a fraction of the per-slice
+            max |lambda| (avoids singular metrics where the curvature
+            collapsed along one direction).
+
+    Returns:
+        ``(..., d, d)`` PSD reconstruction with eigenvalues
+        ``max(|lambda_i|, floor_rel * max_j |lambda_j|)``.
+    """
+    Msym = 0.5 * (M + np.swapaxes(M, -1, -2))
+    w, V = np.linalg.eigh(Msym)
+    w_abs = np.abs(w)
+    w_max = np.max(w_abs, axis=-1, keepdims=True)
+    w_floor = floor_rel * np.maximum(w_max, np.finfo(w.dtype).tiny)
+    w_fixed = np.maximum(w_abs, w_floor)
+    return np.einsum("...ij,...j,...kj->...ik", V, w_fixed, V)
 
 
 class SOBBHWDMHeterodyne(GBWDMHeterodyne):

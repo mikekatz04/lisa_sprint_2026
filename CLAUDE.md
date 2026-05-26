@@ -59,6 +59,33 @@ each backend against the others at the inner-product level before
 merging.
 
 
+## No backend strings as function kwargs (sprint-wide rule)
+
+When a class or function needs a compute backend (CPU C++, CUDA C++,
+JAX, ...), the backend choice MUST be made at object instantiation,
+not as a keyword argument on individual methods. Concretely:
+
+- **Allowed:** ``MyClass(force_backend="cpu")`` /
+  ``MyClass(force_backend="cuda12x")`` / ``MyClass(force_backend="jax")``.
+  Construct subclasses of :class:`FastLISAResponseParallelModule` /
+  :class:`LISAToolsParallelModule` etc. and use ``self.backend`` /
+  ``self.backend.xp`` / ``self.backend.name`` to dispatch internally.
+- **Forbidden in method signatures:** ``backend="jax"`` / ``backend="cpp"`` /
+  ``use_cpp=True`` / ``use_jax=True``. Method names MAY carry a backend
+  suffix (e.g. ``get_ll_grad_jax``) when the implementation is
+  intrinsically tied to that backend, but the choice of which method
+  to call belongs to the caller -- not a runtime kwarg.
+
+Rationale: one instance = one backend, so its arrays / kernels /
+dispatchers stay consistent. Mixing backends per call leads to
+ambiguous ownership of ``xp`` arrays, surprise host↔device copies, and
+brittle dispatch logic.
+
+This rule applies to **this folder and all sub-repos** (lisa-on-gpu,
+LISAanalysistools, GPUBackendTools, BBHx, FastEMRIWaveforms, GBGPU,
+Eryn, plus any repo-root scripts in the sprint tree).
+
+
 ## Narrowband mismatches mm2 / mm5 (chunked-het / WDM validation)
 
 When verifying a chunked-heterodyne or other narrowband WDM template

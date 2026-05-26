@@ -480,6 +480,8 @@ print(f"\nSample alpha for cross-check: {alpha_sample}, t_scale={t_scale_sample}
 
 template_raw = make_chebyshev_template(alpha_sample, N, dt, cheb_wave,
                                        t_scale=t_scale_sample)
+
+template_raw = hXYZ[0].copy()
 assert template_raw is not None, "Sample alpha gave an invalid template."
 
 snr_norm, template_n = normalize_template(template_raw, invC_A_full, dt, df, N)
@@ -527,17 +529,47 @@ def objective(params):
     ``xp`` (numpy or cupy) and the FFTs/IFFTs happen on the active backend.
     """
     alpha_vec, t_scale = split_params(params)
-    template = make_chebyshev_template(alpha_vec, N, dt, cheb_wave,
+    template_1 = make_chebyshev_template(alpha_vec, N, dt, cheb_wave,
                                        t_scale=t_scale)
-    if template is None:
+    
+    if template_1 is None:
         return 1.0  # invalid template -> bad fitness
-    snr0, template_n = normalize_template(template, invC_A_full, dt, df, N)
-    if template_n is None:
-        return 1.0
-    snr_tau = cross_correlation_snr_tau(template_n, D_A_xp, invC_A_full,
-                                        dt, df, N)
+    
+    middle_ind = int(len(template_1) / 2)
+    for inds_chop in [10, 100, 1000, 10000]:
+        template = template_1.copy()
+        template[:middle_ind - inds_chop] = 0.0
+        template[middle_ind + inds_chop:] = 0.0 
+
+        snr0, template_n = normalize_template(template, invC_A_full, dt, df, N)
+        if template_n is None:
+            return 1.0
+        snr_tau = cross_correlation_snr_tau(template_n, D_A_xp, invC_A_full,
+                                            dt, df, N)
+        plt.plot(snr_tau, label=f"{inds_chop}")
+    plt.legend()
+    plt.show()
+    breakpoint()
     return -float(snr_tau.max())
 
+
+lags_full_np    = (np.arange(N) - N // 2) * dt
+snr_tau_shifted_np = _to_cpu(xp.fft.fftshift(snr_tau_fft))
+fig_cheb, axc   = plt.subplots(figsize=(9, 3.5))
+axc.plot(lags_full_np, snr_tau_shifted_np, lw=0.7)
+# axc.axhline(snr_best, color="gray", ls=":",
+#             label=f"max = {snr_best:.3f}")
+# axc.axvline(tau_peak_best, color="r", ls="--", alpha=0.5,
+#             label=f"tau* = {tau_peak_best:.0f} s")
+axc.set_xlabel("time shift tau [s]")
+axc.set_ylabel("|<d_A|h_norm>|(tau)")
+axc.set_title("Best-fit Chebyshev template — SNR(tau)")
+axc.legend(loc="upper right")
+plt.tight_layout()
+out_png_cheb = os.path.join(os.path.dirname(__file__),
+                            "emri_snr_correlation_chebyshev.png")
+plt.show()
+#.png
 
 print("\nRunning differential_evolution over (alpha_0..alpha_4, t_scale) ...")
 result = differential_evolution(
