@@ -30,6 +30,7 @@ Then, against the A channel of the AET injection:
 import os
 import numpy as np
 import matplotlib.pyplot as plt
+plt.rcParams['text.usetex'] = False
 
 from scipy.interpolate import CubicSpline
 from scipy.optimize import differential_evolution
@@ -63,7 +64,7 @@ from few.waveform import GenerateEMRIWaveform
 # generator, response wrapper, lisatools containers, and the chebyshev
 # matched-filter math — picks up this choice via ``force_backend=backend``
 # or the resolved ``xp`` module below.
-backend = "cpu"
+backend = "cuda12x"
 
 backend_obj = lisatools.get_backend(backend)
 xp = backend_obj.xp  # numpy on CPU, cupy on a CUDA backend
@@ -81,7 +82,7 @@ Tobs    = 6.0 / 12.0      # ~ 2 months in years -- short for speed
 t_start = 0.5 * YRSID_SI  # arbitrary epoch into the orbits
 
 orbits     = EqualArmlengthOrbits(force_backend=backend)
-tdi_config = TDIConfig("1st generation")
+tdi_config = TDIConfig("1st generation", force_backend=backend)
 
 # -----------------------------------------------------------------------------
 # 2. EMRI generator (FastKerrEccentricEquatorialFlux), single-mode at call time
@@ -90,7 +91,7 @@ emri_gen = GenerateEMRIWaveform(
     "FastKerrEccentricEquatorialFlux",
     return_list=False,
     inspiral_kwargs={"DENSE_STEPPING": 0, "max_init_len": int(1e4),
-                     "force_backend": backend},
+                     "force_backend": "cpu"},
     sum_kwargs={"pad_output": True},
     frame="detector",
     mode_selector_kwargs={"mode_selection_threshold": 1e-5},
@@ -256,7 +257,7 @@ lags_AET_np    = _to_cpu(lags_AET)
 snr_AET_tau_np = _to_cpu(snr_AET_tau)
 lags_XYZ_np    = _to_cpu(lags_XYZ)
 snr_XYZ_tau_np = _to_cpu(snr_XYZ_tau)
-
+plt.rcParams['text.usetex'] = False
 fig, ax = plt.subplots(2, 1, figsize=(9, 6), sharex=True)
 ax[0].plot(lags_AET_np, snr_AET_tau_np, lw=0.7)
 ax[0].axhline( snr_AET_lt, color="gray", ls=":", label=f"lisatools = {snr_AET_lt:.3f}")
@@ -534,24 +535,19 @@ def objective(params):
     
     if template_1 is None:
         return 1.0  # invalid template -> bad fitness
-    
-    middle_ind = int(len(template_1) / 2)
-    for inds_chop in [10, 100, 1000, 10000]:
-        template = template_1.copy()
-        template[:middle_ind - inds_chop] = 0.0
-        template[middle_ind + inds_chop:] = 0.0 
-
-        snr0, template_n = normalize_template(template, invC_A_full, dt, df, N)
-        if template_n is None:
-            return 1.0
-        snr_tau = cross_correlation_snr_tau(template_n, D_A_xp, invC_A_full,
-                                            dt, df, N)
-        plt.plot(snr_tau, label=f"{inds_chop}")
-    plt.legend()
-    plt.show()
-    breakpoint()
-    return -float(snr_tau.max())
-
+    snr0, template_n = normalize_template(template, invC_A_full, dt, df, N)
+    if template_n is None:
+        return 1.0
+    snr_tau = cross_correlation_snr_tau(template_n, D_A_xp, invC_A_full,
+                                        dt, df, N)
+    tmp2 = (tmp1 := (snr_tau ** 2 - 1.0)) - np.mean(tmp1)
+    cum_sum_snr = xp.cumsum(tmp2)
+    max_val = -np.inf
+    for delta in [1, 4, 16, 64, 256, 1024, 4096]:
+        tmp_arr = cum_sum_snr[delta:] - cum_sum_snr[:-delta]
+        if max_val < tmp_arr.max().item():
+            max_val = tmp_arr.max().item()
+    return -float(max_val)
 
 lags_full_np    = (np.arange(N) - N // 2) * dt
 snr_tau_shifted_np = _to_cpu(xp.fft.fftshift(snr_tau_fft))
