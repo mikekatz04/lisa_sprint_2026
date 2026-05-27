@@ -25,6 +25,7 @@ except (ImportError, ModuleNotFoundError) as e:
 from lisatools.detector import ESAOrbits, EqualArmlengthOrbits
 from lisaconstants import ASTRONOMICAL_YEAR
 from lisatools.utils.constants import YRSID_SI
+from lisatools.utils.utility import get_array_module
 from fastlisaresponse import ResponseWrapper
 from fastlisaresponse.tdiconfig import TDIConfig
 from fastlisaresponse.response import icrs_to_ecliptic
@@ -98,8 +99,9 @@ class _FullGridWDMHolder:
     surface ``gbcomps.GBWDMComputations.get_ll_wdm`` reads.
     """
     def __init__(self, data_full, invC_diag_full):
-        self.linear_data_arr = [np.ascontiguousarray(data_full).ravel()]
-        self.linear_psd_arr  = [np.ascontiguousarray(invC_diag_full).ravel()]
+        xp = get_array_module(data_full)
+        self.linear_data_arr = [xp.ascontiguousarray(data_full).ravel()]
+        self.linear_psd_arr  = [xp.ascontiguousarray(invC_diag_full).ravel()]
 
     def __len__(self):
         return 1
@@ -107,10 +109,12 @@ class _FullGridWDMHolder:
 
 if __name__ == "__main__":
     backend = "cpu"
+    comp_backend = "cuda12x"
 
     xp = np if backend == "cpu" else cp
 
     orbits = ESAOrbits(force_backend=backend)
+    orbits_gpu = ESAOrbits(force_backend=comp_backend)
     # ORBIT_DT (s) or ORBIT_LINEAR=1 to configure orbits more densely.
     # Default base orbits use dt_base ~ 1.87 days with 5th-order interp.
     _orbit_dt = os.environ.get("ORBIT_DT", "")
@@ -134,7 +138,7 @@ if __name__ == "__main__":
     Tobs = Nt * wavelet_duration
     Nobs = Nf * Nt
 
-    tdi_config = TDIConfig('2nd generation')  # mojito
+    tdi_config = TDIConfig('2nd generation', force_backend=backend)  # mojito
 
     t_start = int(1 / 2 * YRSID_SI / dt) * dt  # 6 months
     t_arr = np.arange(Nobs) * dt + t_start
@@ -190,7 +194,7 @@ if __name__ == "__main__":
     min_time = _EDGE_CUT * wavelet_duration
     max_time = (Nt - _EDGE_CUT) * wavelet_duration
 
-    wdm_set = WDMSettings(Nf, Nt, dt, min_freq=min_freq, max_freq=max_freq, min_time=min_time, max_time=max_time)
+    wdm_set = WDMSettings(Nf, Nt, dt, min_freq=min_freq, max_freq=max_freq, min_time=min_time, max_time=max_time, force_backend=backend)
 
     # --- chunked-heterodyne computations (template + likelihood) ----------
     # ``GBWDMComputations`` is the FastLISAResponseParallelModule whose
@@ -209,6 +213,18 @@ if __name__ == "__main__":
         orbits=orbits,                                  # MUST match injection
         tdi_config="2nd generation",
         force_backend=backend,
+        d_d=0.0,                                        # source-only return
+        tdi_type="XYZ",
+    )
+    gb_wdm_comp_gpu = GBWDMComputations(
+        Nf=Nf, Nt=Nt, dt=dt, T=Tobs, t_ref=t_ref,
+        Nt_sub=Nt_sub, n_pad=n_pad, N_sparse=N_sparse,
+        N_cp_sig=int(os.environ.get("N_CP_SIG", 0)),
+        N_cp_orbit=int(os.environ.get("N_CP_ORBIT", 0)),
+        t_obs_start=float(t_start),                     # MUST match t_arr[0]
+        orbits=orbits_gpu,                                  # MUST match injection
+        tdi_config="2nd generation",
+        force_backend=comp_backend,
         d_d=0.0,                                        # source-only return
         tdi_type="XYZ",
     )
@@ -260,7 +276,6 @@ if __name__ == "__main__":
         inj_tmp = gb_gen_inj(amp, f0, fdot, fddot, phi0, inc, psi, lam, beta,
                              convert_to_ra_dec=False, return_spline=True)
         _data_inj[:] = inj_tmp.eval_tdi(t_arr)
-
         data_inj_all = TDSignal(_data_inj, settings=td_set).transform(output_set, window=window)
         injection = DataResidualArray(data_inj_all)
         if sens_mat_proto is None:
@@ -269,8 +284,12 @@ if __name__ == "__main__":
 
         gb_gen_wrap = GBChunkedWaveWrap(gb_wdm_comp, wdm_set, Nf, Nt)
         analysis = AnalysisContainer(injection, sens_mat, signal_gen=gb_gen_wrap)
+        wdm_set_gpu = WDMSettings(Nf, Nt, dt, min_freq=min_freq, max_freq=max_freq, min_time=min_time, max_time=max_time, force_backend=comp_backend)
+        data_gpu = DataResidualArray(WDMSignal(wdm_set_gpu.xp.asarray(analysis.data_res_arr[:]), wdm_set_gpu))
+        gpus = [] if comp_backend != "cuda12x" else [0]
+        sens_gpu = XYZ2SensitivityMatrix(wdm_set_gpu, model="scirdv1")
         wdm_holder = AnalysisContainerArray([analysis])
-
+        wdm_holder_gpu = AnalysisContainerArray([AnalysisContainer(data_gpu, sens_gpu)], gpus=gpus)
         # Build template via chunked-het. (No separate Python vs C path
         # like the lookup script; chunked-het is the single C++ template
         # builder.)
@@ -341,7 +360,7 @@ if __name__ == "__main__":
         print(f"[result] calculate_signal_likelihood          = {tmp_val3}")
         print(f"[result] Noise-weighted mismatch (chunked-het) = {_mm:.3e}")
         print(f"[result] mm5 (+-5-layer band, chunked-het)     = {_mm5:.3e}")
-
+        plt.rcParams['text.usetex'] = False
         fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, sharey=True, figsize=(11, 6))
         data_inj_all.heatmap(fig=fig, ax=ax1, index=0, add_cax=True)
         template_fill_wdm.heatmap(fig=fig, ax=ax2, index=0)
@@ -464,7 +483,7 @@ if __name__ == "__main__":
         # Wrap the full-grid ``(3, Nf, Nt)`` data + diagonal invC into a
         # duck-type the new ``get_ll_wdm`` accepts (``len()`` +
         # ``linear_data_arr[0]`` + ``linear_psd_arr[0]``).
-        wdm_holder_full = _FullGridWDMHolder(data_d_full, invC_full)
+        wdm_holder_full = _FullGridWDMHolder(wdm_set_gpu.xp.asarray(data_d_full), wdm_set_gpu.xp.asarray(invC_full))
 
         def logl_vec(x, transform_fn=None, **_kw):
             """Vectorized chunked-het source-only log-likelihood for Eryn.
@@ -489,7 +508,7 @@ if __name__ == "__main__":
             else:
                 phys = x_arr
             
-            ll = gb_wdm_comp.get_ll_wdm(
+            ll = gb_wdm_comp_gpu.get_ll_wdm(
                 phys, wdm_holder_full,
                 convert_to_ra_dec=False,
                 use_layer_groups=_use_layer_groups,
@@ -514,85 +533,85 @@ if __name__ == "__main__":
         # mutates numpy buffers as a side effect, which jax.grad can't
         # trace through).
         # --------------------------------------------------------------
-        import jax
-        import jax.numpy as _jax_xp                       # alias for clarity
-        from fastlisaresponse.jax.wdm.heterodyne_kernels import (
-            gb_wdm_het_get_ll_jax,
-        )
-        from fastlisaresponse.jax.sources.ucb import JaxUCBSource
-
-        gb_wdm_comp_jax = GBWDMComputations(
-            Nf=Nf, Nt=Nt, dt=dt, T=Tobs, t_ref=t_ref,
-            Nt_sub=Nt_sub, n_pad=n_pad, N_sparse=N_sparse,
-            N_cp_sig=int(os.environ.get("N_CP_SIG", 0)),
-            N_cp_orbit=int(os.environ.get("N_CP_ORBIT", 0)),
-            t_obs_start=float(t_start),
-            orbits=orbits, tdi_config="2nd generation",
-            force_backend="jax", d_d=0.0, tdi_type="XYZ",
-        )
+#        import jax
+#        import jax.numpy as _jax_xp                       # alias for clarity
+#        from fastlisaresponse.jax.wdm.heterodyne_kernels import (
+#            gb_wdm_het_get_ll_jax,
+#        )
+#        from fastlisaresponse.jax.sources.ucb import JaxUCBSource
+#
+ #       gb_wdm_comp_jax = GBWDMComputations(
+        #    Nf=Nf, Nt=Nt, dt=dt, T=Tobs, t_ref=t_ref,
+  #          Nt_sub=Nt_sub, n_pad=n_pad, N_sparse=N_sparse,
+   #         N_cp_sig=int(os.environ.get("N_CP_SIG", 0)),
+    #        N_cp_orbit=int(os.environ.get("N_CP_ORBIT", 0)),
+     #       t_obs_start=float(t_start),
+      #      orbits=orbits, tdi_config="2nd generation",
+       #     force_backend="jax", d_d=0.0, tdi_type="XYZ",
+       # )
         # JAX-side static kernel args -- built once, reused per call.
-        _jax_data_d = _jax_xp.asarray(data_d_full)
-        _jax_invC   = _jax_xp.asarray(invC_full)
-        _jax_chunk_t_starts = _jax_xp.asarray(gb_wdm_comp_jax.chunk_t_starts)
-        _jax_chunk_keep_lo  = _jax_xp.asarray(gb_wdm_comp_jax.chunk_keep_lo)
-        _jax_chunk_keep_hi  = _jax_xp.asarray(gb_wdm_comp_jax.chunk_keep_hi)
-        _jax_chunk_n_lo     = _jax_xp.asarray(
-            gb_wdm_comp_jax.chunk_n_global_offset
-        )
-        _jax_wdm_window     = _jax_xp.asarray(gb_wdm_comp_jax.wdm_window)
-        _jax_orbits         = gb_wdm_comp_jax.cpp_orbits     # OrbitsWrapJAX
-        _jax_tdi_config     = gb_wdm_comp_jax.cpp_tdi_config # TDIConfigWrapJAX
-        _jax_source         = JaxUCBSource(t_ref=float(t_ref))
+#        _jax_data_d = _jax_xp.asarray(data_d_full)
+ #       _jax_invC   = _jax_xp.asarray(invC_full)
+  #      _jax_chunk_t_starts = _jax_xp.asarray(gb_wdm_comp_jax.chunk_t_starts)
+   #     _jax_chunk_keep_lo  = _jax_xp.asarray(gb_wdm_comp_jax.chunk_keep_lo)
+    #    _jax_chunk_keep_hi  = _jax_xp.asarray(gb_wdm_comp_jax.chunk_keep_hi)
+     #   _jax_chunk_n_lo     = _jax_xp.asarray(
+      #      gb_wdm_comp_jax.chunk_n_global_offset
+#        )
+ #       _jax_wdm_window     = _jax_xp.asarray(gb_wdm_comp_jax.wdm_window)
+  #      _jax_orbits         = gb_wdm_comp_jax.cpp_orbits     # OrbitsWrapJAX
+   #     _jax_tdi_config     = gb_wdm_comp_jax.cpp_tdi_config # TDIConfigWrapJAX
+    #    _jax_source         = JaxUCBSource(t_ref=float(t_ref))
+#
+ #         def _sampled_to_phys_jax(x):
+ #         """Replicate the TransformContainer (sampled -> phys 9-D).
+#
+ #           sampled order: amp, f0, fdot0, phi0, cosinc, psi, lam, sinbeta
+  #          phys order:    amp, f0, fdot0, fddot0, phi0, inc, psi, lam, beta
+   #         """
+    #        xp = _jax_xp
+     #       amp     = x[:, 0]
+      #      f0      = x[:, 1]
+       #     fdot0   = x[:, 2]
+#            phi0    = x[:, 3]
+ #           cosinc  = x[:, 4]
+  #          psi     = x[:, 5]
+   #         lam     = x[:, 6]
+    #        sinbeta = x[:, 7]
+     #       inc     = xp.arccos(xp.clip(cosinc, -1.0 + 1e-12, 1.0 - 1e-12))
+      #      beta    = xp.arcsin(xp.clip(sinbeta, -1.0 + 1e-12, 1.0 - 1e-12))
+       #     fddot   = xp.zeros_like(amp)
+        #    return xp.stack(
+#                [amp, f0, fdot0, fddot, phi0, inc, psi, lam, beta], axis=-1,
+ #           )
+#
+ #       def _scalar_logl_sampled(x_arr):
+  #          """Sum_i L_i for jax.grad; per-walker L_i depends only on
+   #         x[i, :], so the gradient block-diagonalises and one grad
+    #        call recovers (N, 8) per-walker gradients.
+     #       """
+      #      phys = _sampled_to_phys_jax(x_arr)
+       #     d_h, h_h = gb_wdm_het_get_ll_jax(
+        #        phys, _jax_data_d, _jax_invC,
+         #       _jax_chunk_t_starts, _jax_chunk_keep_lo, _jax_chunk_keep_hi,
+#                _jax_chunk_n_lo,
+ #               _jax_source, _jax_orbits, _jax_tdi_config,
+  #              _jax_wdm_window,
+   #             Nf=Nf, Nt=Nt, Nt_sub=Nt_sub, N_sparse=N_sparse,
+    #            dt=dt, T_chunk=gb_wdm_comp_jax.T_chunk,
+     #           tukey_alpha=gb_wdm_comp_jax.resolved_tukey_alpha,
+      #      )
+       #     return _jax_xp.sum(d_h - 0.5 * h_h)
 
-        def _sampled_to_phys_jax(x):
-            """Replicate the TransformContainer (sampled -> phys 9-D).
-
-            sampled order: amp, f0, fdot0, phi0, cosinc, psi, lam, sinbeta
-            phys order:    amp, f0, fdot0, fddot0, phi0, inc, psi, lam, beta
-            """
-            xp = _jax_xp
-            amp     = x[:, 0]
-            f0      = x[:, 1]
-            fdot0   = x[:, 2]
-            phi0    = x[:, 3]
-            cosinc  = x[:, 4]
-            psi     = x[:, 5]
-            lam     = x[:, 6]
-            sinbeta = x[:, 7]
-            inc     = xp.arccos(xp.clip(cosinc, -1.0 + 1e-12, 1.0 - 1e-12))
-            beta    = xp.arcsin(xp.clip(sinbeta, -1.0 + 1e-12, 1.0 - 1e-12))
-            fddot   = xp.zeros_like(amp)
-            return xp.stack(
-                [amp, f0, fdot0, fddot, phi0, inc, psi, lam, beta], axis=-1,
-            )
-
-        def _scalar_logl_sampled(x_arr):
-            """Sum_i L_i for jax.grad; per-walker L_i depends only on
-            x[i, :], so the gradient block-diagonalises and one grad
-            call recovers (N, 8) per-walker gradients.
-            """
-            phys = _sampled_to_phys_jax(x_arr)
-            d_h, h_h = gb_wdm_het_get_ll_jax(
-                phys, _jax_data_d, _jax_invC,
-                _jax_chunk_t_starts, _jax_chunk_keep_lo, _jax_chunk_keep_hi,
-                _jax_chunk_n_lo,
-                _jax_source, _jax_orbits, _jax_tdi_config,
-                _jax_wdm_window,
-                Nf=Nf, Nt=Nt, Nt_sub=Nt_sub, N_sparse=N_sparse,
-                dt=dt, T_chunk=gb_wdm_comp_jax.T_chunk,
-                tukey_alpha=gb_wdm_comp_jax.resolved_tukey_alpha,
-            )
-            return _jax_xp.sum(d_h - 0.5 * h_h)
-
-        _grad_logl_sampled = jax.grad(_scalar_logl_sampled)
-
-        def grad_logl_vec_jax(x, **_kw):
-            """Untempered gradient of logl. NUTSMove applies beta itself."""
-            x_arr = np.asarray(x, dtype=float)
-            if x_arr.ndim == 1:
-                x_arr = x_arr[None, :]
-            g = np.asarray(_grad_logl_sampled(_jax_xp.asarray(x_arr)))
-            return g
+#        _grad_logl_sampled = jax.grad(_scalar_logl_sampled)
+#
+ #       def grad_logl_vec_jax(x, **_kw):
+  #          """Untempered gradient of logl. NUTSMove applies beta itself."""
+   #         x_arr = np.asarray(x, dtype=float)
+    #        if x_arr.ndim == 1:
+     #           x_arr = x_arr[None, :]
+      #      g = np.asarray(_grad_logl_sampled(_jax_xp.asarray(x_arr)))
+       #     return g
 
     else:  # DOMAIN == "fd"
         # FD path: FFT the TD injection (no window, dt-scaled rfft, same

@@ -122,8 +122,8 @@ response_XYZ = ResponseWrapper(emri_gen, orbits=orbits, tdi_chan="XYZ",
 # -----------------------------------------------------------------------------
 # 3. Source parameters (matching the existing test script in this workspace)
 # -----------------------------------------------------------------------------
-m1, m2, a    = 534673.46222, 9.508330389, 0.988
-p0, e0, xI0  = 13.57389267, 0.015584839, -1.0
+m1, m2, a    = 534673.46222, 9.508330389, 0.2
+p0, e0, xI0  = 8.57389267, 0.015584839, 1.0
 dist         = 1.06696103277                                   # Gpc
 beta, lam    = 0.50015698, 4.707806421         # ecliptic
 qS, phiS     = np.pi / 2 - beta, lam                 # polar / azimuth
@@ -521,7 +521,7 @@ def split_params(params):
     return params[:N_ALPHA], float(params[N_ALPHA])
 
 
-def objective(params):
+def objective(params, return_snr_max=False):
     """Return -max_tau |<d_A|h_norm>(tau)|  (we minimise).
 
     ``params`` arrives from scipy as a CPU numpy array. The chebyshev
@@ -535,19 +535,22 @@ def objective(params):
     
     if template_1 is None:
         return 1.0  # invalid template -> bad fitness
-    snr0, template_n = normalize_template(template, invC_A_full, dt, df, N)
-    if template_n is None:
+    snr0, template_n1 = normalize_template(template_1, invC_A_full, dt, df, N)
+    if template_n1 is None:
         return 1.0
-    snr_tau = cross_correlation_snr_tau(template_n, D_A_xp, invC_A_full,
+    snr_tau = cross_correlation_snr_tau(template_n1, D_A_xp, invC_A_full,
                                         dt, df, N)
-    tmp2 = (tmp1 := (snr_tau ** 2 - 1.0)) - np.mean(tmp1)
+    tmp2 = (tmp1 := (snr_tau ** 2 - 1.0))  # - np.mean(tmp1)
     cum_sum_snr = xp.cumsum(tmp2)
     max_val = -np.inf
     for delta in [1, 4, 16, 64, 256, 1024, 4096]:
-        tmp_arr = cum_sum_snr[delta:] - cum_sum_snr[:-delta]
+        tmp_arr = (_cum_sum_diff := (cum_sum_snr[delta:] - cum_sum_snr[:-delta])) / _cum_sum_diff.shape[0] ** (1/2) 
         if max_val < tmp_arr.max().item():
             max_val = tmp_arr.max().item()
+    if return_snr_max:
+        return -float(max_val), snr_tau.max().item()
     return -float(max_val)
+    #return -float(tmp2.max() ** 2)
 
 lags_full_np    = (np.arange(N) - N // 2) * dt
 snr_tau_shifted_np = _to_cpu(xp.fft.fftshift(snr_tau_fft))
@@ -563,7 +566,8 @@ axc.set_title("Best-fit Chebyshev template — SNR(tau)")
 axc.legend(loc="upper right")
 plt.tight_layout()
 out_png_cheb = os.path.join(os.path.dirname(__file__),
-                            "emri_snr_correlation_chebyshev.png")
+                          "emri_snr_correlation_chebyshev.png")
+plt.savefig(out_png_cheb)
 plt.show()
 #.png
 
@@ -588,6 +592,9 @@ tpl_best       = make_chebyshev_template(alpha_best, N, dt, cheb_wave,
                                          t_scale=t_scale_best)
 _, tpl_best_n  = normalize_template(tpl_best, invC_A_full, dt, df, N)
 snr_tau_best   = cross_correlation_snr_tau(tpl_best_n, D_A_xp, invC_A_full,
+                                           dt, df, N)
+
+snr_tau_best   = cross_correlation_snr_tau(template_n, D_A_xp, invC_A_full,
                                            dt, df, N)
 i_peak_best    = int(snr_tau_best.argmax())
 # Signed lag index in the unshifted irfft array
@@ -672,3 +679,21 @@ out_png_cheb = os.path.join(os.path.dirname(__file__),
 plt.savefig(out_png_cheb, dpi=130)
 print(f"\nSaved plot -> {out_png_cheb}")
 plt.close(fig_cheb)
+
+from eryn.prior import ProbDistContainer, uniform_dist
+alphas = ProbDistContainer({
+        0: uniform_dist(10.6,    11.7),
+        1: uniform_dist(-0.97,  -0.66),
+        2: uniform_dist(-0.052, -0.005),
+        3: uniform_dist(-0.0041, +0.0018),
+        4: uniform_dist(-0.0010, +0.0003),
+        5: uniform_dist(2.0, 2000.0),
+})
+print("STARTING!!!!!!!")
+max_val = -np.inf
+for draw in alphas.rvs(10000):
+    tmp = objective(draw, return_snr_max=True)[-1]
+    if max_val < tmp:
+         max_val = tmp
+         print("max_val raised:", max_val)
+breakpoint()
