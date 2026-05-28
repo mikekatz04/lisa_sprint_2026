@@ -194,8 +194,14 @@ if __name__ == "__main__":
     min_time = _EDGE_CUT * wavelet_duration
     max_time = (Nt - _EDGE_CUT) * wavelet_duration
 
-    wdm_set = WDMSettings(Nf, Nt, dt, min_freq=min_freq, max_freq=max_freq, min_time=min_time, max_time=max_time, force_backend=backend)
-    wdm_set_gpu = WDMSettings(Nf, Nt, dt, min_freq=min_freq, max_freq=max_freq, min_time=min_time, max_time=max_time, force_backend=comp_backend)
+    wdm_set     = WDMSettings(Nf, Nt, dt, t0=t_start,
+                               min_freq=min_freq, max_freq=max_freq,
+                               min_time=min_time, max_time=max_time,
+                               force_backend=backend)
+    wdm_set_gpu = WDMSettings(Nf, Nt, dt, t0=t_start,
+                               min_freq=min_freq, max_freq=max_freq,
+                               min_time=min_time, max_time=max_time,
+                               force_backend=comp_backend)
     # --- chunked-heterodyne computations (template + likelihood) ----------
     # ``GBWDMComputations`` is the FastLISAResponseParallelModule whose
     # ``fill_global_wdm`` / ``get_ll_wdm`` / ``get_ll_grad_wdm`` route

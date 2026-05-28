@@ -20,8 +20,11 @@ from phentax.waveform import IMRPhenomTHM
 
 from lisaconstants import ASTRONOMICAL_YEAR
 import matplotlib.pyplot as plt
-import scienceplots
-plt.style.use(["science", "notebook"])
+try:
+    import scienceplots  # noqa: F401
+    plt.style.use(["science", "notebook"])
+except ModuleNotFoundError:
+    pass
 
 FIGSIZE = (10, 6)
 
