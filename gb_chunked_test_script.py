@@ -307,22 +307,18 @@ if __name__ == "__main__":
         tmp_val3 = analysis.calculate_signal_likelihood(*params[0], source_only=True)
 
         # Direct C++ chunked-het get_ll cross-check vs lisatools' get_ll
-        # (analysis.calculate_signal_likelihood, source_only=True). Builds
-        # the full-grid data + invC slabs the C++ kernel expects. The invC
-        # layout is tdi_type-dependent (matches the binding's expectation):
-        #   XYZ      -> sens_mat.invC is (3, 3, Nf_active, Nt_active); the
-        #               C++ kernel does the full sum_{c1,c2} d*h*invC
-        #               (matches lisatools' inner_product exactly).
-        #   AET / AE -> diagonal-only; legacy 1/Sigma_cc path retained.
+        # (analysis.calculate_signal_likelihood, source_only=True). The
+        # C++ kernel now consumes active-band-sized arrays directly (it
+        # iterates over (m, n_glob) and skips pixels outside the active
+        # band), so no full-grid zero padding is needed -- pass the
+        # natural lisatools active-band arrays straight through.
+        #   XYZ      -> sens_mat.invC is (3, 3, Nf_active, Nt_active).
+        #   AET / AE -> diagonal (3, Nf_active, Nt_active) from 1/Sigma_cc.
         _nch = 3
         _inj_active = np.asarray(injection.data_res_arr.arr)
         _xyz_cross = (gb_wdm_comp.tdi_type == "XYZ")
-        _ilo = wdm_set.ind_min_f
-        _ihi = wdm_set.ind_max_f + 1
         if _xyz_cross:
             _invC_active = np.asarray(sens_mat.invC)        # (3, 3, Nfa, Nta)
-            _invC_active = np.where(np.isfinite(_invC_active), _invC_active, 0.0)
-            _invC_full   = np.zeros((_nch, _nch, Nf, Nt), dtype=float)
         else:
             _psd_active = np.asarray(sens_mat.sens_mat)
             if _psd_active.ndim == 4:
@@ -334,17 +330,8 @@ if __name__ == "__main__":
                     np.isfinite(_psd_diag) & (_psd_diag > 0),
                     _psd_diag, np.inf,
                 )
-            _invC_active = np.where(np.isfinite(_invC_active), _invC_active, 0.0)
-            _invC_full   = np.zeros((_nch, Nf, Nt), dtype=float)
-        _data_d_full = np.zeros((_nch, Nf, Nt), dtype=float)
-        if wdm_set.Nt_active == wdm_set.Nt:
-            _data_d_full[..., _ilo:_ihi, :] = _inj_active
-            _invC_full  [..., _ilo:_ihi, :] = _invC_active
-        else:
-            _tslice = wdm_set.active_slice_t
-            _data_d_full[..., _ilo:_ihi, _tslice] = _inj_active
-            _invC_full  [..., _ilo:_ihi, _tslice] = _invC_active
-        _holder_cpp_check = _FullGridWDMHolder(_data_d_full, _invC_full)
+        _invC_active = np.where(np.isfinite(_invC_active), _invC_active, 0.0)
+        _holder_cpp_check = _FullGridWDMHolder(_inj_active, _invC_active)
         # use_layer_groups=False -> full-band C++ inner product, matching
         # the lisatools active-band integral. convert_to_ra_dec=False since
         # params is already (lam, beta) physical, not (RA, dec) sampled.
@@ -528,18 +515,12 @@ if __name__ == "__main__":
         # (which multiplies by 4 * differential_component). See
         # gb_chunked_prior_draws.py lines ~400-450 for the same recipe.
         nch = 3
-        inj_active_arr = np.asarray(injection.data_res_arr.arr)
-        ilo = wdm_set.ind_min_f
-        ihi = wdm_set.ind_max_f + 1
-        # invC layout depends on tdi_type (matches C++ kernel expectation):
-        #   XYZ      -> sens_mat.invC is (3, 3, Nfa, Nta); kernel does the
-        #               full cross-channel sum.
-        #   AET / AE -> diagonal 1/Sigma_cc (3, Nfa, Nta); legacy fast path.
+        # Active-band layout (kernel iterates m, n_glob and skips outside).
+        # No full-grid padding needed.
+        inj_active_arr = np.asarray(injection.data_res_arr.arr)  # (3, Nfa, Nta)
         xyz_cross = (gb_wdm_comp.tdi_type == "XYZ")
         if xyz_cross:
-            invC_active = np.asarray(sens_mat.invC)
-            invC_active = np.where(np.isfinite(invC_active), invC_active, 0.0)
-            invC_full   = np.zeros((nch, nch, Nf, Nt), dtype=float)
+            invC_active = np.asarray(sens_mat.invC)              # (3, 3, Nfa, Nta)
         else:
             psd_active = np.asarray(sens_mat.sens_mat)
             if psd_active.ndim == 4:
@@ -551,16 +532,9 @@ if __name__ == "__main__":
                     np.isfinite(psd_diag) & (psd_diag > 0),
                     psd_diag, np.inf,
                 )
-            invC_active = np.where(np.isfinite(invC_active), invC_active, 0.0)
-            invC_full   = np.zeros((nch, Nf, Nt), dtype=float)
-        data_d_full = np.zeros((nch, Nf, Nt), dtype=float)
-        if wdm_set.Nt_active == wdm_set.Nt:
-            data_d_full[..., ilo:ihi, :] = inj_active_arr
-            invC_full  [..., ilo:ihi, :] = invC_active
-        else:
-            tslice = wdm_set.active_slice_t
-            data_d_full[..., ilo:ihi, tslice] = inj_active_arr
-            invC_full  [..., ilo:ihi, tslice] = invC_active
+        invC_active = np.where(np.isfinite(invC_active), invC_active, 0.0)
+        data_d_full = inj_active_arr
+        invC_full   = invC_active
 
         d_d_lt = float(np.real(analysis.inner_product()))
         print(f"[mcmc/wdm] d_d (lisatools) = {d_d_lt:.6e}", flush=True)
