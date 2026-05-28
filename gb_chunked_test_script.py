@@ -109,7 +109,7 @@ class _FullGridWDMHolder:
 
 if __name__ == "__main__":
     backend = "cpu"
-    comp_backend = "cuda12x"
+    comp_backend = "cpu"
 
     xp = np if backend == "cpu" else cp
 
@@ -195,7 +195,7 @@ if __name__ == "__main__":
     max_time = (Nt - _EDGE_CUT) * wavelet_duration
 
     wdm_set = WDMSettings(Nf, Nt, dt, min_freq=min_freq, max_freq=max_freq, min_time=min_time, max_time=max_time, force_backend=backend)
-
+    wdm_set_gpu = WDMSettings(Nf, Nt, dt, min_freq=min_freq, max_freq=max_freq, min_time=min_time, max_time=max_time, force_backend=comp_backend)
     # --- chunked-heterodyne computations (template + likelihood) ----------
     # ``GBWDMComputations`` is the FastLISAResponseParallelModule whose
     # ``fill_global_wdm`` / ``get_ll_wdm`` / ``get_ll_grad_wdm`` route
@@ -205,11 +205,10 @@ if __name__ == "__main__":
     N_sparse = int(os.environ.get("N_SPARSE", 256))
     n_pad = int(os.environ.get("N_PAD", Nt_sub // 8))
     gb_wdm_comp = GBWDMComputations(
-        Nf=Nf, Nt=Nt, dt=dt, T=Tobs, t_ref=t_ref,
+        wdm_set, t_ref=t_ref,
         Nt_sub=Nt_sub, n_pad=n_pad, N_sparse=N_sparse,
         N_cp_sig=int(os.environ.get("N_CP_SIG", 0)),
         N_cp_orbit=int(os.environ.get("N_CP_ORBIT", 0)),
-        t_obs_start=float(t_start),                     # MUST match t_arr[0]
         orbits=orbits,                                  # MUST match injection
         tdi_config="2nd generation",
         force_backend=backend,
@@ -217,11 +216,10 @@ if __name__ == "__main__":
         tdi_type="XYZ",
     )
     gb_wdm_comp_gpu = GBWDMComputations(
-        Nf=Nf, Nt=Nt, dt=dt, T=Tobs, t_ref=t_ref,
+        wdm_set_gpu, t_ref=t_ref,
         Nt_sub=Nt_sub, n_pad=n_pad, N_sparse=N_sparse,
-        N_cp_sig=int(os.environ.get("N_CP_SIG", 0)),
-        N_cp_orbit=int(os.environ.get("N_CP_ORBIT", 0)),
-        t_obs_start=float(t_start),                     # MUST match t_arr[0]
+        N_cp_sig=int(os.environ.get("N_CP_SIG", 48)),
+        N_cp_orbit=int(os.environ.get("N_CP_ORBIT", 32)),
         orbits=orbits_gpu,                                  # MUST match injection
         tdi_config="2nd generation",
         force_backend=comp_backend,
@@ -284,9 +282,9 @@ if __name__ == "__main__":
 
         gb_gen_wrap = GBChunkedWaveWrap(gb_wdm_comp, wdm_set, Nf, Nt)
         analysis = AnalysisContainer(injection, sens_mat, signal_gen=gb_gen_wrap)
-        wdm_set_gpu = WDMSettings(Nf, Nt, dt, min_freq=min_freq, max_freq=max_freq, min_time=min_time, max_time=max_time, force_backend=comp_backend)
+        
         data_gpu = DataResidualArray(WDMSignal(wdm_set_gpu.xp.asarray(analysis.data_res_arr[:]), wdm_set_gpu))
-        gpus = [] if comp_backend != "cuda12x" else [0]
+        gpus = None if comp_backend != "cuda12x" else [0]
         sens_gpu = XYZ2SensitivityMatrix(wdm_set_gpu, model="scirdv1")
         wdm_holder = AnalysisContainerArray([analysis])
         wdm_holder_gpu = AnalysisContainerArray([AnalysisContainer(data_gpu, sens_gpu)], gpus=gpus)
@@ -671,8 +669,50 @@ if __name__ == "__main__":
                 phys = transform_fn.both_transforms(x_arr.copy())  # (N, 9)
             else:
                 phys = x_arr
-            ll = fd_comp.get_ll_fd(phys, convert_to_ra_dec=False)
-            return np.asarray(ll)
+            ll = np.asarray(fd_comp.get_ll_fd(phys, convert_to_ra_dec=False))
+            _bad = ~np.isfinite(ll)
+            if _bad.any():
+                _idx = np.where(_bad)[0]
+                print(f"[fd/NaN] {_bad.sum()}/{ll.size} non-finite ll values "
+                      f"on this batch (logl_vec call)", flush=True)
+                _full_basis = ["amp", "f0", "fdot0", "fddot0", "phi0", "inc",
+                               "psi", "lam", "beta"]
+                _samp_basis = ["amp", "f0", "fdot0", "phi0", "cosinc", "psi",
+                               "lam", "sinbeta"]
+                for _k in _idx[:5]:
+                    _ph = phys[_k]
+                    _sm = x_arr[_k]
+                    print(f"  [{_k}] ll={ll[_k]}", flush=True)
+                    print(f"        sampled: " + ", ".join(
+                        f"{_n}={_v:.6e}" for _n, _v in zip(_samp_basis, _sm)),
+                          flush=True)
+                    print(f"        phys   : " + ", ".join(
+                        f"{_n}={_v:.6e}" for _n, _v in zip(_full_basis, _ph)),
+                          flush=True)
+                # Also report which physical params are out-of-domain.
+                _amp  = phys[_idx, 0]
+                _f0   = phys[_idx, 1]
+                _fdot = phys[_idx, 2]
+                _inc  = phys[_idx, 5]
+                _beta = phys[_idx, 8]
+                print(f"  range: amp [{_amp.min():.3e}, {_amp.max():.3e}]  "
+                      f"f0 [{_f0.min():.3e}, {_f0.max():.3e}]  "
+                      f"fdot [{_fdot.min():.3e}, {_fdot.max():.3e}]",
+                      flush=True)
+                print(f"         inc [{_inc.min():.4f}, {_inc.max():.4f}]  "
+                      f"beta [{_beta.min():.4f}, {_beta.max():.4f}]",
+                      flush=True)
+                _nan_phys = ~np.isfinite(phys[_idx]).all(axis=1)
+                print(f"  rows with NaN/Inf in phys after transform: "
+                      f"{_nan_phys.sum()}/{len(_idx)}", flush=True)
+                # Persist the first batch with offenders for offline analysis.
+                if not hasattr(logl_vec, "_dumped"):
+                    np.savez("fd_nan_debug.npz",
+                             sampled=x_arr, phys=phys, ll=ll,
+                             bad_idx=_idx)
+                    print("  -> wrote fd_nan_debug.npz", flush=True)
+                    logl_vec._dumped = True
+            return ll
 
     ntemps = int(os.environ.get("NTEMPS", 10))
     nwalkers = int(os.environ.get("NWALKERS", 20))

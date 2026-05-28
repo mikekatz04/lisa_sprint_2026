@@ -691,7 +691,7 @@ alphas = ProbDistContainer({
 })
 print("STARTING!!!!!!!")
 max_val = -np.inf
-for draw in alphas.rvs(10000):
+for draw in alphas.rvs(100000):
     tmp = objective(draw, return_snr_max=True)[-1]
     if max_val < tmp:
          max_val = tmp

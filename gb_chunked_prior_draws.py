@@ -162,7 +162,7 @@ def main():
     max_time = (Nt - 20) * wavelet_duration
 
     wdm_set = WDMSettings(
-        Nf, Nt, dt,
+        Nf, Nt, dt, t0=t_start,
         min_freq=min_freq, max_freq=max_freq,
         min_time=min_time, max_time=max_time,
         force_backend=backend,
@@ -174,12 +174,11 @@ def main():
     # ``GBComputationGroupWrap.gb_wdm_het_*`` on the chosen backend
     # (C++ on cpu/cuda, pure-JAX on the ``jax`` backend).
     chunked = GBWDMComputations(
-        Nf=Nf, Nt=Nt, dt=dt, T=Tobs, t_ref=t_ref,
+        wdm_set, t_ref=t_ref,
         Nt_sub=Nt_sub, n_pad=n_pad, N_sparse=N_sparse,
         # Cache knobs (default 0 = direct; override via env to engage cache).
         N_cp_sig   = int(os.environ.get("N_CP_SIG",   0)),
         N_cp_orbit = int(os.environ.get("N_CP_ORBIT", 0)),
-        t_obs_start=float(t_start),                     # MUST match t_arr[0]
         orbits=orbits,                                  # MUST match injection
         tdi_config="2nd generation",
         force_backend=backend,
