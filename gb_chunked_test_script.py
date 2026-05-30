@@ -109,7 +109,7 @@ class _FullGridWDMHolder:
 
 if __name__ == "__main__":
     backend = "cpu"
-    comp_backend = "cpu"
+    comp_backend = "cuda12x"
 
     xp = np if backend == "cpu" else cp
 
@@ -332,22 +332,35 @@ if __name__ == "__main__":
                 )
         _invC_active = np.where(np.isfinite(_invC_active), _invC_active, 0.0)
         _holder_cpp_check = _FullGridWDMHolder(_inj_active, _invC_active)
+        _holder_cpp_check_gpu = _FullGridWDMHolder(wdm_set_gpu.xp.asarray(_inj_active), wdm_set_gpu.xp.asarray(_invC_active))
+        
         # use_layer_groups=False -> full-band C++ inner product, matching
         # the lisatools active-band integral. convert_to_ra_dec=False since
         # params is already (lam, beta) physical, not (RA, dec) sampled.
         gb_wdm_comp.d_d = check_ip_d_d
-        _ll_cpp_raw = float(np.asarray(
-            gb_wdm_comp.get_ll_wdm(
-                params, _holder_cpp_check,
+        num_bin_rep = 1000
+        params_in = np.tile(params, (num_bin_rep, 1))
+        num = 4
+        import time
+        st = time.perf_counter()
+        for _ in range(num): 
+            tmp = gb_wdm_comp_gpu.get_ll_wdm(
+                params_in, _holder_cpp_check_gpu,
                 convert_to_ra_dec=False,
                 use_layer_groups=False,
+                grid_dim=512
             )
-        )[0])
-
+    
+        _ll_cpp_raw_gpu = float(tmp[0])
+        et = time.perf_counter()
+        _tot_time = et - st
+        print(f"full: {_tot_time}, per loop: {_tot_time / num}, per_bin {_tot_time / (num * num_bin_rep)}")
+        exit()
+        breakpoint()
         # Component breakdown -- gb_wdm_comp stashes <d|h> and <h|h> as
         # side effects on the instance after each get_ll_wdm call.
-        _d_h_cpp_raw = float(np.asarray(gb_wdm_comp.d_h_out)[0])
-        _h_h_cpp_raw = float(np.asarray(gb_wdm_comp.h_h_out)[0])
+        _d_h_cpp_raw = float(gb_wdm_comp_gpu.d_h_out[0])
+        _h_h_cpp_raw = float(gb_wdm_comp_gpu.h_h_out[0])
         # WDM differential_component is 0.25, so the lisatools prefactor
         # 4*dc = 1 -- the cross-channel C++ sum is now identical to
         # lisatools' inner_product. No empirical scale required.
@@ -423,7 +436,7 @@ if __name__ == "__main__":
         print(f"[result] calculate_signal_inner_product       = {tmp_val2}")
         print(f"[result] template_likelihood (chunked-het)    = {check_ll}")
         print(f"[result] calculate_signal_likelihood          = {tmp_val3}")
-        print(f"[result] all C++ get_ll_wdm output           = {_ll_cpp_raw}")
+        print(f"[result] all C++ get_ll_wdm output           = {_ll_cpp_raw_gpu}")
         print(f"[result] gb_wdm_comp.get_ll_wdm (C++ direct) = {tmp_val3_cpp}    "
               f"|cpp - lisatools|/|lisatools| = "
               f"{abs(tmp_val3_cpp - float(tmp_val3)) / max(abs(float(tmp_val3)), 1e-300):.3e}")
