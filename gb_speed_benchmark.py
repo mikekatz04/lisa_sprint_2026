@@ -2,17 +2,18 @@
 """
 Three-way WDM speed benchmark: JAX vs cupy-batched vs C++ CUDA on GPU.
 
-Mirrors the WDM-grid setup from ``gb_chunked_test_script.py``
-(Nf=1460, Nt=2560, dt=10s, N_sparse=256, Nt_sub=256, 1-yr obs) and
-times the WDM-domain ``get_ll`` per call for three GPU paths:
+Mirrors the WDM-grid setup from ``gb_chunked_test_script.py`` (Nf=1460,
+Nt=2560, dt=10s, N_sparse=256, 1-yr obs) but configures all three
+paths to the SAME single-chunk-whole-obs heterodyne algorithm
+(``Nt_sub == Nt``, ``n_pad == 0`` -> ``n_chunks == 1``):
 
-    A) C++ CUDA (chunked-het kernel)  -- GBWDMComputations(force_backend='cuda12x')
-    B) JAX-GPU  (chunked-het scan)    -- GBWDMComputations(force_backend='jax')
-    C) cupy batched (single-chunk)    -- GBHeterodyneWDMGetLL on cuda12x
+    A) C++ CUDA          -- GBWDMComputations(force_backend='cuda12x')
+    B) JAX-GPU           -- GBWDMComputations(force_backend='jax')
+    C) cupy batched      -- GBHeterodyneWDMGetLL on cuda12x
 
-The C++ and JAX paths share the same chunked-heterodyne algorithm; method
-(C) is the alternative single-chunk-whole-obs heterodyne that trades
-algorithmic depth for batched cupy throughput on global memory.
+All three compute the same ``<d|h>`` and ``<h|h>`` numerically (modulo
+floating-point reassociation noise), so we get a true apples-to-apples
+speed comparison plus an algorithmic-correctness cross-check.
 
 Run
 ---
@@ -234,13 +235,17 @@ def bench_cpp_cuda(prob, holder, params, label="C++/CUDA"):
 
 
 def bench_jax(prob, holder_jax, params, label="JAX/GPU"):
-    """Path B: GBWDMComputations(force_backend='jax').get_ll_wdm."""
+    """Path B: GBWDMComputations(force_backend='jax').get_ll_wdm.
+
+    SINGLE-CHUNK configuration (Nt_sub=Nt, n_pad=0) so JAX runs the same
+    single-chunk-whole-obs heterodyne as method (C) cupy.
+    """
     from fastlisaresponse.gbcomps import GBWDMComputations
     import jax.numpy as jnp
 
     comp = GBWDMComputations(
         wdm_settings=prob["wdm_set"], t_ref=prob["t_ref"],
-        Nt_sub=prob["Nt_sub"], n_pad=prob["Nt_sub"] // 8,
+        Nt_sub=prob["Nt"], n_pad=0,                  # single chunk
         N_sparse=prob["N_sparse"],
         N_cp_sig=prob["N_cp_sig"], N_cp_orbit=prob["N_cp_orbit"],
         orbits=prob["orbits"], tdi_config="2nd generation",
@@ -398,12 +403,12 @@ def main():
                 results["JAX/GPU chunked-het"] = (t_b, out_b)
                 print(f"  JAX/GPU chunked-het        {t_b*1e3:9.2f} ms  "
                       f"({t_b*1e6/num_bin:8.2f} us/bin)")
-                # Verify C++ vs JAX (same algorithm; should match).
+                # Verify C++ vs JAX (same single-chunk algorithm; should match).
                 if "C++/CUDA chunked-het" in results:
                     out_a = results["C++/CUDA chunked-het"][1]
                     rel = np.max(np.abs(out_b - out_a)
                                   / np.maximum(np.abs(out_a), 1e-300))
-                    print(f"    JAX vs C++ ll reldiff  = {rel:.3e}  "
+                    print(f"    JAX vs C++ ll reldiff   = {rel:.3e}  "
                           f"{'PASS' if rel < 1e-8 else 'FAIL'}")
             except Exception as e:
                 print(f"  JAX/GPU: FAIL ({type(e).__name__}: {e})")
@@ -416,6 +421,13 @@ def main():
             results["cupy batched WDM"] = (t_c, out_c)
             print(f"  cupy batched WDM (single)  {t_c*1e3:9.2f} ms  "
                   f"({t_c*1e6/num_bin:8.2f} us/bin)")
+            # cupy vs C++ -- same single-chunk algorithm; should match.
+            if "C++/CUDA chunked-het" in results:
+                out_a = results["C++/CUDA chunked-het"][1]
+                rel = np.max(np.abs(out_c - out_a)
+                              / np.maximum(np.abs(out_a), 1e-300))
+                print(f"    cupy vs C++ ll reldiff  = {rel:.3e}  "
+                      f"{'PASS' if rel < 1e-8 else 'FAIL'}")
         except Exception as e:
             print(f"  cupy batched WDM: FAIL ({type(e).__name__}: {e})")
 

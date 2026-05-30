@@ -90,9 +90,25 @@ class GBHeterodyneWDMGetLL(FastLISAResponseParallelModule):
         tukey_alpha: float = 0.0,
     ):
         super().__init__(force_backend=force_backend)
-        for x, n in [(N_sparse, "N_sparse"), (Nf, "Nf"), (Nt_sub, "Nt_sub")]:
-            if x < 1 or (x & (x - 1)) != 0:
-                raise ValueError(f"{n}={x} must be a power of two.")
+        # N_sparse: heterodyne FFT length. cupy fft handles any length, but
+        # the C++ radix-2 kernel needs power-of-2 -- match that constraint
+        # so the same N_sparse value flows across backends.
+        if N_sparse < 1 or (N_sparse & (N_sparse - 1)) != 0:
+            raise ValueError(
+                f"N_sparse={N_sparse} must be a power of two "
+                "(matches the C++ radix-2 FFT convention)."
+            )
+        # Nt_sub: per-layer iFFT length in the FD->WDM transform. Only
+        # needs to be even for the half-bin (m * Nt_sub//2 + ...) WDM
+        # geometry; not power-of-2.
+        if Nt_sub < 2 or Nt_sub % 2 != 0:
+            raise ValueError(
+                f"Nt_sub={Nt_sub} must be even (WDM half-bin geometry)."
+            )
+        # Nf: number of WDM layers; no FFT of this length, any positive
+        # integer is fine. gb_chunked_test_script uses Nf=1460.
+        if Nf < 1:
+            raise ValueError(f"Nf={Nf} must be positive.")
         if abs(float(t_start) - float(t_ref)) > 1e-9:
             raise ValueError("t_start must equal t_ref.")
         if tdi_type not in {"XYZ", "AET", "AE"}:

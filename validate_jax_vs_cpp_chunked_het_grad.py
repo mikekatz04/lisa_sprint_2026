@@ -49,8 +49,8 @@ def main():
     cpp = GBWDMHeterodyne(
         Nf=NF, Nt=NT, dt=DT, T_full=Tobs, t_ref_full=t_obs_start,
         Nt_sub=NT_SUB, n_pad=N_PAD, N_sparse=N_SPARSE,
-        backend="cpu", tdi_gen="2nd generation",
-        orbits=orbits, t_obs_start=t_obs_start, use_cpp=True,
+        force_backend="cpu", tdi_gen="2nd generation",
+        orbits=orbits, t_obs_start=t_obs_start,
         N_cp_sig=0, N_cp_orbit=0,
     )
 

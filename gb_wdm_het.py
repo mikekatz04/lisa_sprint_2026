@@ -690,6 +690,7 @@ class GBWDMHeterodyne(FastLISAResponseParallelModule):
             float(self.T_full), float(self.t_ref_full),
             float(self._cpp_tukey_alpha), int(grid_dim),
             int(self.N_cp_sig), int(self.N_cp_orbit),
+            int(1),  # m_band_half_width
         )
 
     def _call_cpp_get_ll(self, d_h_out, h_h_out, data_d, invC,
@@ -735,6 +736,7 @@ class GBWDMHeterodyne(FastLISAResponseParallelModule):
             int(self.N_cp_sig), int(self.N_cp_orbit),
             binary_perm, group_starts, group_ends,
             group_m_lo, group_m_hi, int(n_groups),
+            int(1),  # m_band_half_width (default narrow-band)
         )
 
     def _call_cpp_swap_ll(self, out_5tuple, data_d, invC,
@@ -783,6 +785,7 @@ class GBWDMHeterodyne(FastLISAResponseParallelModule):
             binary_perm, group_starts, group_ends,
             group_m_lo, group_m_hi, int(n_groups),
             pair_m_lo_b, pair_m_hi_b,
+            int(1),  # m_band_half_width
         )
 
     # ------------------------------------------------------------------

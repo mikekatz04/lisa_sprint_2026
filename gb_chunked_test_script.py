@@ -110,7 +110,7 @@ class _FullGridWDMHolder:
 
 if __name__ == "__main__":
     backend = "cpu"
-    comp_backend = "cuda12x"
+    comp_backend = "cpu"
 
     xp = np if backend == "cpu" else cp
 
@@ -339,9 +339,9 @@ if __name__ == "__main__":
         # the lisatools active-band integral. convert_to_ra_dec=False since
         # params is already (lam, beta) physical, not (RA, dec) sampled.
         gb_wdm_comp.d_d = check_ip_d_d
-        num_bin_rep = 10000
+        num_bin_rep = 10
         params_in = np.tile(params, (num_bin_rep, 1))
-        num = 10
+        num = 1
         import time
         st = time.perf_counter()
         for _ in range(num): 
@@ -356,8 +356,8 @@ if __name__ == "__main__":
         et = time.perf_counter()
         _tot_time = et - st
         print(f"full: {_tot_time}, per loop: {_tot_time / num}, per_bin {_tot_time / (num * num_bin_rep)}")
-        exit()
-        breakpoint()
+        # exit()
+        # breakpoint()
         # Component breakdown -- gb_wdm_comp stashes <d|h> and <h|h> as
         # side effects on the instance after each get_ll_wdm call.
         _d_h_cpp_raw = float(gb_wdm_comp_gpu.d_h_out[0])
