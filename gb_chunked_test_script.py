@@ -31,7 +31,8 @@ from fastlisaresponse.tdiconfig import TDIConfig
 from fastlisaresponse.response import icrs_to_ecliptic
 from fastlisaresponse.tdionfly import GBTDIonTheFly
 
-from lisatools.datacontainer import DataResidualArray
+# DataResidualArray is the deprecated wrapper; pass DomainBase children
+# (WDMSignal / FDSignal / TDSignal / STFTSignal) directly to AnalysisContainer.
 from lisatools.analysiscontainer import AnalysisContainer, AnalysisContainerArray
 from lisatools.sensitivity import XYZ2SensitivityMatrix
 from lisatools.domains import TDSettings, TDSignal, FDSettings, FDSignal, WDMSettings, WDMSignal
@@ -281,15 +282,15 @@ if __name__ == "__main__":
                              convert_to_ra_dec=False, return_spline=True)
         _data_inj[:] = inj_tmp.eval_tdi(t_arr)
         data_inj_all = TDSignal(_data_inj, settings=td_set).transform(output_set, window=window)
-        injection = DataResidualArray(data_inj_all)
+        injection = data_inj_all  # DomainBase (WDMSignal); pass directly to AC
         if sens_mat_proto is None:
-            sens_mat_proto = XYZ2SensitivityMatrix(injection.data_res_arr.settings, model="scirdv1")
+            sens_mat_proto = XYZ2SensitivityMatrix(injection.settings, model="scirdv1")
         sens_mat = sens_mat_proto
 
         gb_gen_wrap = GBChunkedWaveWrap(gb_wdm_comp, wdm_set, Nf, Nt)
         analysis = AnalysisContainer(injection, sens_mat, signal_gen=gb_gen_wrap)
-        
-        data_gpu = DataResidualArray(WDMSignal(wdm_set_gpu.xp.asarray(analysis.data_res_arr[:]), wdm_set_gpu))
+
+        data_gpu = WDMSignal(wdm_set_gpu.xp.asarray(analysis.data[:]), wdm_set_gpu)
         gpus = None if comp_backend != "cuda12x" else [0]
         sens_gpu = XYZ2SensitivityMatrix(wdm_set_gpu, model="scirdv1")
         wdm_holder = AnalysisContainerArray([analysis])
@@ -315,7 +316,7 @@ if __name__ == "__main__":
         #   XYZ      -> sens_mat.invC is (3, 3, Nf_active, Nt_active).
         #   AET / AE -> diagonal (3, Nf_active, Nt_active) from 1/Sigma_cc.
         _nch = 3
-        _inj_active = np.asarray(injection.data_res_arr.arr)
+        _inj_active = np.asarray(injection.arr)
         _xyz_cross = (gb_wdm_comp.tdi_type == "XYZ")
         if _xyz_cross:
             _invC_active = np.asarray(sens_mat.invC)        # (3, 3, Nfa, Nta)
@@ -380,10 +381,10 @@ if __name__ == "__main__":
         )
         _m_lo = _new_wdm_set.ind_min_f - wdm_set.ind_min_f
         _m_hi = _new_wdm_set.ind_max_f - wdm_set.ind_min_f + 1
-        _inj_here = DataResidualArray(WDMSignal(injection[:, _m_lo:_m_hi], _new_wdm_set))
-        _sens_here = XYZ2SensitivityMatrix(_new_wdm_set, model="scirdv1")
-        _ah5 = AnalysisContainer(_inj_here, _sens_here)
-        _tpl_here = DataResidualArray(WDMSignal(template_fill_wdm[:, _m_lo:_m_hi], _new_wdm_set))
+        _inj_here = WDMSignal(injection[:, _m_lo:_m_hi], _new_wdm_set)
+        _ah5 = AnalysisContainer(_inj_here, XYZ2SensitivityMatrix,
+                                 sens_mat_kwargs=dict(model="scirdv1"))
+        _tpl_here = WDMSignal(template_fill_wdm[:, _m_lo:_m_hi], _new_wdm_set)
         _mm5 = float(1.0 - _ah5.template_inner_product(_tpl_here, normalize=True))
 
         _results.append((_ff, _f_frac_meas, _mm, _mm5))
