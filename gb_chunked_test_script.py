@@ -339,9 +339,9 @@ if __name__ == "__main__":
         # the lisatools active-band integral. convert_to_ra_dec=False since
         # params is already (lam, beta) physical, not (RA, dec) sampled.
         gb_wdm_comp.d_d = check_ip_d_d
-        num_bin_rep = 1000
+        num_bin_rep = 10000
         params_in = np.tile(params, (num_bin_rep, 1))
-        num = 4
+        num = 10
         import time
         st = time.perf_counter()
         for _ in range(num): 
