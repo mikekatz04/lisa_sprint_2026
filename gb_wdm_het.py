@@ -647,6 +647,31 @@ class GBWDMHeterodyne(FastLISAResponseParallelModule):
         # (the OrbitsWrap stores raw pointers into them).
         self._orbits_py = orbits
 
+        # WDMSettings wrap (recent C++-binding change: every
+        # ``gb_wdm_het_*`` entry point now takes a ``WDMSettingsWrap *``
+        # immediately after ``tdi_config_wrap``, reading Nf / Nt /
+        # ind_min_f / ind_max_f / ind_min_t / ind_max_t off it instead
+        # of taking ``Nf`` / ``Nt`` ints in the int-arg block). For
+        # GBWDMHeterodyne the active band IS the full grid -- this
+        # class doesn't carry an ind_min/max concept like
+        # GBWDMComputations does -- so we point ind_min_* at 0 and
+        # ind_max_* at the corresponding N-1, making Nf_active=Nf and
+        # Nt_active=Nt for the kernel's data_d / invC length checks.
+        layer_df = 1.0 / (2.0 * self.Nf * self.dt)
+        layer_dt_grid = self.Nf * self.dt
+        self._cpp_wdm_settings = self._be.WDMSettingsWrap(
+            float(layer_df),
+            float(layer_dt_grid),
+            int(self.Nf), int(self.Nt),
+            int(self.nchannels),
+            int(0), int(self.Nt - 1),   # ind_min_t, ind_max_t (full Nt active)
+            int(0), int(self.Nf - 1),   # ind_min_f, ind_max_f (full Nf active)
+        )
+        # ``tdi_type`` int the kernel uses to switch the invC layout
+        # (XYZ cross-channel vs AET/AE diagonal). GBWDMHeterodyne is
+        # XYZ-only today; the constant lives on the backend dict.
+        self._tdi_type_int = int(self._be.TDITypeDict["XYZ"])
+
         # Geometry arrays passed straight to the kernel. chunk_t_starts
         # is ABSOLUTE seconds (= t_obs_start + n0 * layer_dt).
         layer_dt = self.Nf * self.dt
@@ -674,16 +699,24 @@ class GBWDMHeterodyne(FastLISAResponseParallelModule):
         return arr.copy(), num_bin
 
     def _call_cpp_fill_global(self, template_out, params_flat, factors, num_bin, grid_dim):
+        # Binding signature (recent): (template, orbits, tdi_config,
+        # wdm_settings, params, factors, chunk_t_starts, keep_lo, keep_hi,
+        # n_global_offset, wdm_window, n_chunks, num_bin, nparams,
+        # Nt_sub, log2_Nt_sub, N_sparse, log2_N_sparse, nchannels,
+        # n_rfft_chunk, T_chunk, dt, T, t_ref, tukey_alpha, grid_dim,
+        # N_cp_sig, N_cp_orbit, m_band_half_width). Nf / Nt are read off
+        # ``wdm_settings`` by the kernel and no longer passed as ints.
         getattr(self._cpp_group, f"{self._CPP_METHOD_PREFIX}_fill_global")(
             np.asarray(template_out).reshape(-1),
             self._cpp_orbits, self._cpp_tdi_config,
+            self._cpp_wdm_settings,
             params_flat, factors,
             self._cpp_chunk_t_starts,
             self._cpp_chunk_keep_lo, self._cpp_chunk_keep_hi,
             self._cpp_chunk_n_global_offset,
             self._cpp_wdm_window,
             self.n_chunks, int(num_bin), int(self._CPP_NPARAMS),
-            int(self.Nf), int(self.Nt), int(self.Nt_sub), int(self.log2_Nt_sub),
+            int(self.Nt_sub), int(self.log2_Nt_sub),
             int(self.N_sparse), int(self.log2_N_sparse),
             int(self.nchannels), int(self.n_rfft_chunk),
             float(self.T_chunk), float(self.dt),
@@ -716,9 +749,14 @@ class GBWDMHeterodyne(FastLISAResponseParallelModule):
             group_m_lo     = np.asarray(groups["group_m_lo"],   dtype=np.int32)
             group_m_hi     = np.asarray(groups["group_m_hi"],   dtype=np.int32)
             n_groups       = int(groups["n_groups"])
+        # Binding signature (recent): inserts ``wdm_settings`` after
+        # ``tdi_config`` and ``tdi_type`` after ``t_ref``. Nf / Nt are
+        # now read off ``wdm_settings`` by the kernel and dropped from
+        # the int-arg block.
         getattr(self._cpp_group, f"{self._CPP_METHOD_PREFIX}_get_ll")(
             d_h_out, h_h_out,
             self._cpp_orbits, self._cpp_tdi_config,
+            self._cpp_wdm_settings,
             params_flat, data_idx, noise_idx,
             self._cpp_chunk_t_starts,
             self._cpp_chunk_keep_lo, self._cpp_chunk_keep_hi,
@@ -727,11 +765,12 @@ class GBWDMHeterodyne(FastLISAResponseParallelModule):
             np.asarray(data_d).reshape(-1),
             np.asarray(invC).reshape(-1),
             self.n_chunks, int(num_bin), int(self._CPP_NPARAMS),
-            int(self.Nf), int(self.Nt), int(self.Nt_sub), int(self.log2_Nt_sub),
+            int(self.Nt_sub), int(self.log2_Nt_sub),
             int(self.N_sparse), int(self.log2_N_sparse),
             int(self.nchannels), int(self.n_rfft_chunk),
             float(self.T_chunk), float(self.dt),
             float(self.T_full), float(self.t_ref_full),
+            int(self._tdi_type_int),
             float(self._cpp_tukey_alpha), int(grid_dim),
             int(self.N_cp_sig), int(self.N_cp_orbit),
             binary_perm, group_starts, group_ends,
@@ -763,9 +802,12 @@ class GBWDMHeterodyne(FastLISAResponseParallelModule):
             pair_m_lo_b    = np.asarray(groups["pair_m_lo_b"],  dtype=np.int32)
             pair_m_hi_b    = np.asarray(groups["pair_m_hi_b"],  dtype=np.int32)
             n_groups       = int(groups["n_groups"])
+        # Binding signature (recent): same wdm_settings + tdi_type
+        # insertions as get_ll. Nf / Nt dropped from the int args.
         getattr(self._cpp_group, f"{self._CPP_METHOD_PREFIX}_swap_ll")(
             d_h_add, d_h_rem, aa, rr, ar,
             self._cpp_orbits, self._cpp_tdi_config,
+            self._cpp_wdm_settings,
             params_add_flat, params_rem_flat,
             data_idx, noise_idx,
             self._cpp_chunk_t_starts,
@@ -775,11 +817,12 @@ class GBWDMHeterodyne(FastLISAResponseParallelModule):
             np.asarray(data_d).reshape(-1),
             np.asarray(invC).reshape(-1),
             self.n_chunks, int(num_bin), int(self._CPP_NPARAMS),
-            int(self.Nf), int(self.Nt), int(self.Nt_sub), int(self.log2_Nt_sub),
+            int(self.Nt_sub), int(self.log2_Nt_sub),
             int(self.N_sparse), int(self.log2_N_sparse),
             int(self.nchannels), int(self.n_rfft_chunk),
             float(self.T_chunk), float(self.dt),
             float(self.T_full), float(self.t_ref_full),
+            int(self._tdi_type_int),
             float(self._cpp_tukey_alpha), int(grid_dim),
             int(self.N_cp_sig), int(self.N_cp_orbit),
             binary_perm, group_starts, group_ends,
@@ -1822,22 +1865,92 @@ class GBWDMHeterodyne(FastLISAResponseParallelModule):
         sprint convention; 1D / 2D ``params`` are auto-promoted via
         ``atleast_2d`` internally).
 
-        Forwards directly to :meth:`fill_global` -- the chunked-het
-        kernel already accepts ``(num_templates, nchannels, Nf, Nt)``
-        and ``data_index`` per source, so the only adapter work is to
-        normalise the params layout and apply the optional sky
-        transform.
+        ``templates`` may be either a single global ``(nchannels, Nf,
+        Nt)`` slab (data_index=None or all-zero) or a multi-slab
+        ``(num_templates, nchannels, Nf, Nt)`` buffer with
+        ``data_index[b] in [0, num_templates)`` selecting which slab
+        each binary writes into. Flat (1D) buffers are also accepted
+        and reshaped to ``(num_templates, nchannels, Nf, Nt)``.
+
+        Internally ``fill_global`` doesn't take ``data_index`` -- it
+        writes every binary into a single slab. To honour
+        ``data_index``, we loop over the unique slab indices and call
+        ``fill_global`` once per slab on the corresponding 3D view,
+        with only the binaries assigned to that slab.
+
+        ``source`` is unused (the chunked-het kernel writes templates
+        directly); kept in the signature for drop-in compatibility
+        with :meth:`GBWDMComputations.fill_global_wdm`.
         """
         params = np.atleast_2d(np.asarray(params, dtype=float)).reshape(-1, self._CPP_NPARAMS)
         params_used = self._maybe_ecl_to_icrs(params, convert_to_ra_dec)
-        params_list = [params_used[i] for i in range(params_used.shape[0])]
-        # Note: ``source`` is unused for fill_global -- the legacy
-        # generator takes it to size the cpp_wdm holder, but chunked-het
-        # writes templates directly. We accept it in the signature for
-        # drop-in compatibility.
+        num_bin = params_used.shape[0]
         del source
-        self.fill_global(templates, params_list, factors=factors,
-                         data_index=data_index)
+
+        nch, Nf, Nt = self.nchannels, self.Nf, self.Nt
+        per_template = nch * Nf * Nt
+        # Reshape templates to (num_templates, nch, Nf, Nt) -- supports
+        # 1D flat, 3D single-slab, and 4D multi-slab inputs the same way
+        # GBWDMComputations.fill_global_wdm does. Aliasing the original
+        # buffer (no .copy()) so writes propagate back to the caller.
+        if templates.ndim == 1:
+            assert templates.shape[-1] % per_template == 0, (
+                f"templates flat size {templates.shape[-1]} not divisible "
+                f"by nchannels*Nf*Nt = {per_template}"
+            )
+            num_templates = int(templates.shape[-1] // per_template)
+            templates_view = templates.reshape(num_templates, nch, Nf, Nt)
+        elif templates.ndim == 3:
+            assert templates.shape == (nch, Nf, Nt), (
+                f"3D templates must be ({nch}, {Nf}, {Nt}); got {templates.shape}"
+            )
+            num_templates = 1
+            templates_view = templates[None, :, :, :]
+        elif templates.ndim == 4:
+            assert templates.shape[1:] == (nch, Nf, Nt), (
+                f"4D templates must be (num_templates, {nch}, {Nf}, {Nt}); "
+                f"got {templates.shape}"
+            )
+            num_templates = int(templates.shape[0])
+            templates_view = templates
+        else:
+            raise ValueError(
+                "templates must be 1D (flat), 3D (nchannels, Nf, Nt), or "
+                "4D (num_templates, nchannels, Nf, Nt)."
+            )
+
+        if data_index is None:
+            data_index_arr = np.zeros(num_bin, dtype=np.int32)
+        else:
+            data_index_arr = np.asarray(data_index, dtype=np.int32).reshape(-1)
+            assert data_index_arr.shape == (num_bin,), (
+                f"data_index must have shape ({num_bin},); "
+                f"got {data_index_arr.shape}"
+            )
+            if data_index_arr.size and int(data_index_arr.max()) >= num_templates:
+                raise ValueError(
+                    f"data_index.max()={int(data_index_arr.max())} >= "
+                    f"num_templates={num_templates}: templates buffer is "
+                    "too small for the requested data_index range."
+                )
+
+        if factors is None:
+            factors_arr = np.ones(num_bin, dtype=float)
+        else:
+            factors_arr = np.asarray(factors, dtype=float).reshape(-1)
+            assert factors_arr.shape == (num_bin,), (
+                f"factors must have shape ({num_bin},); got {factors_arr.shape}"
+            )
+
+        # Loop over slabs. Inside fill_global, the kernel accepts
+        # template_out = (nch, Nf, Nt) and writes accumulator-style;
+        # each slab gets only the binaries whose data_index hits it.
+        for slab in np.unique(data_index_arr):
+            mask = (data_index_arr == int(slab))
+            params_slab = [params_used[i] for i in np.flatnonzero(mask)]
+            factors_slab = factors_arr[mask]
+            self.fill_global(templates_view[int(slab)], params_slab,
+                             factors=factors_slab)
 
 
 def psd_fix_eigabs(M, floor_rel=1e-30):
