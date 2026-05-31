@@ -349,7 +349,8 @@ if __name__ == "__main__":
                 params_in, _holder_cpp_check_gpu,
                 convert_to_ra_dec=False,
                 use_layer_groups=False,
-                grid_dim=512
+                grid_dim=512,
+                m_band_half_width=int(os.environ.get("M_BAND_HALF_WIDTH", 3)),
             )
     
         _ll_cpp_raw_gpu = float(tmp[0])

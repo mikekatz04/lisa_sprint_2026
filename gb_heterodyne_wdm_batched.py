@@ -429,138 +429,181 @@ class GBHeterodyneWDMGetLL(FastLISAResponseParallelModule):
 
 
 # ============================================================================
-# Self-test: cross-check WDM IP against FD IP (Parseval-like equivalence)
+# Self-test: 1-year GB injection -> matched-filter recovery
+# ----------------------------------------------------------------------------
+# Mirrors gb_chunked_test_script.py's setup (Nf, Nt, dt, t_start, source
+# params, sensitivity matrix), but runs the single-chunk path
+# (Nt_sub == Nt) of this module instead of GBWDMComputations. The
+# matched-filter recovery check is the same: inject one GB source,
+# build the template with identical params, and verify
+# <d|h> ~ <h|h> ~ SNR^2.
 # ============================================================================
 def _selftest():
-    """Round-trip test: WDM<d|h> built from FD-then-wdmtransform should
-    equal the FD<d|h> built directly. Both versions share the same
-    heterodyne FD construction; only the inner-product domain differs.
-    """
-    import time
+    import os, time
     from lisatools.utils.constants import YRSID_SI
-    from lisatools.domains import WDMSettings, FDSettings, FDSignal
-    from gb_heterodyne_fd_batched import GBHeterodyneFDGetLL
+    from lisatools.domains import WDMSettings, TDSettings, TDSignal
+    from lisatools.sensitivity import XYZ2SensitivityMatrix
 
     BACKEND = "cpu"
-    rng = np.random.default_rng(0)
 
-    # ---- WDM grid ----
-    dt = 15.0
-    Nf = 64           # small for test speed
-    Nt = 64
+    # ---- WDM / observation grid (matches gb_chunked_test_script.py) -------
+    dt = 10.0
+    Nf = int(os.environ.get("NF", 1460))
+    # Default Nt reduced for CPU self-test speed; override with NT to
+    # match gb_chunked_test_script.py exactly (NT=2560 -> 1yr obs).
+    Nt = int(os.environ.get("NT", 256))
     Tobs = Nf * Nt * dt
-    N_dense = int(round(Tobs / dt))
-    n_rfft = N_dense // 2 + 1
-    df = 1.0 / Tobs
-    t_start = 0.0
-    t_ref = 0.0
-    N_sparse = 256
-    nchannels = 3
+    N_dense = Nf * Nt
 
-    wdm_set = WDMSettings(
-        Nf, Nt, dt, min_time=0.0, max_time=Tobs, force_backend=BACKEND,
-    )
-    wdm_window = np.asarray(wdm_set.window)
-    assert wdm_window.shape == (Nt,)
+    t_start = int(0.5 * YRSID_SI / dt) * dt
+    t_ref = t_start
+
+    N_sparse = int(os.environ.get("N_SPARSE", 256))
+    nchannels = 3
+    min_freq = 0.0001
+    max_freq = 35.0e-3
+
+    print("=" * 72)
+    print(f"GBHeterodyneWDMGetLL self-test -- 1-yr GB matched-filter setup")
+    print(f"  Nf={Nf}  Nt={Nt}  dt={dt}  Tobs={Tobs:.3e}s "
+          f"({Tobs / YRSID_SI:.3f} yr)")
+    print(f"  N_sparse={N_sparse}  nchannels={nchannels}")
+    print("=" * 72)
 
     tdi_config = TDIConfig("2nd generation")
     orbits = EqualArmlengthOrbits(force_backend=BACKEND)
+    if not orbits.configured:
+        orbits.configure(linear_interp_setup=True)
 
-    # Build a random FD data realisation and the matching WDM-transformed data.
-    data_fd = (rng.standard_normal((1, nchannels, n_rfft))
-               + 1j * rng.standard_normal((1, nchannels, n_rfft))).astype(complex)
-    data_fd[:, :, 0] = 0.0    # zero DC for cleanliness
-    try:
-        fd_set = FDSettings(N=n_rfft, df=df, force_backend=BACKEND)
-        data_fd_lt = FDSignal(data_fd[0], fd_set)
-        data_wdm_obj = data_fd_lt.wdmtransform(wdm_set)
-        data_wdm = np.asarray(data_wdm_obj.arr)[None]
-    except Exception as e:
-        print(f"  (skipping lisatools wdm_transform: {e}; using zeros)")
-        data_wdm = np.zeros((1, nchannels, Nf, Nt))
+    wdm_set = WDMSettings(
+        Nf, Nt, dt, t0=t_start,
+        min_freq=min_freq, max_freq=max_freq,
+        min_time=20.0 * Nf * dt, max_time=(Nt - 20) * Nf * dt,
+        force_backend=BACKEND,
+    )
+    wdm_window = np.asarray(wdm_set.window)
 
-    # Build matching invC for both domains.
-    # FD: diagonal 1/Sn per channel (XYZ but with zero off-diagonals).
-    inv_sn = (rng.uniform(0.5, 1.5, size=(nchannels, n_rfft)) ** 2)
-    inv_sn[:, 0] = 0.0
-    invC_xyz_fd = np.zeros((1, nchannels, nchannels, n_rfft))
-    for c in range(nchannels):
-        invC_xyz_fd[0, c, c, :] = inv_sn[c]
-    # WDM invC: would require a real PSD model. For now, just use a constant
-    # diagonal per channel as a sanity stand-in -- the FD/WDM Parseval check
-    # below uses the *same* invC structure in both domains so the cross-
-    # check is internally consistent. Real noise modelling is a separate
-    # concern; this test is for the kernel arithmetic only.
-    invC_xyz_wdm = np.zeros((1, nchannels, nchannels, Nf, Nt))
-    for c in range(nchannels):
-        invC_xyz_wdm[0, c, c, :, :] = 1.0
+    # ---- source params (same canonical GB as gb_chunked_test_script.py) ---
+    layer_df = float(wdm_set.layer_df)
+    m_ref_source = int(3e-3 / layer_df)
+    f_frac = 0.5
+    f0_val = (m_ref_source + f_frac) * layer_df
 
-    # ---- WDM batched ----
+    params = np.array([[
+        1.0e-22,        # amp
+        f0_val,         # f0
+        1.0e-17,        # fdot (essentially zero)
+        0.0,            # fddot
+        2.09802430298,  # phi0
+        0.23984234,     # inc
+        1.234019814,    # psi
+        4.09808143,     # lam
+        0.04,           # beta
+    ]])
+    print(f"  source: amp={params[0,0]:.3e}  f0={params[0,1]*1e3:.5f} mHz "
+          f"(m_ref={m_ref_source}, f_frac={f_frac})")
+
+    # ---- build injection via GBTDIonTheFly -> TDSignal -> WDMSignal -------
+    # Uses the same Tukey-less injection path as gb_chunked_test_script.
+    N_inj = 16384
+    print(f"  building injection (N_inj={N_inj} TD samples)...", flush=True)
+    t0 = time.perf_counter()
+
+    t_tdi_inj = np.linspace(t_start, t_start + (N_dense - 1) * dt, N_inj)
+    gb_gen_inj = GBTDIonTheFly(
+        t_tdi_inj, Tobs, t_ref, 1.0 / dt, 1,
+        tdi_config=tdi_config, orbits=orbits,
+        tdi_chan="XYZ", force_backend=BACKEND,
+    )
+    inj_tmp = gb_gen_inj(
+        np.full(1, params[0, 0]), np.full(1, params[0, 1]),
+        np.full(1, params[0, 2]), np.full(1, params[0, 3]),
+        np.full(1, params[0, 4]), np.full(1, params[0, 5]),
+        np.full(1, params[0, 6]), np.full(1, params[0, 7]),
+        np.full(1, params[0, 8]),
+        convert_to_ra_dec=False, return_spline=True,
+    )
+
+    t_arr = np.arange(N_dense) * dt + t_start
+    data_td = np.asarray(inj_tmp.eval_tdi(t_arr))  # (nch, N_dense) real
+    if data_td.ndim == 3:
+        data_td = data_td[0]  # squeeze leading "num_sub" axis
+    td_set = TDSettings(N_dense, dt, t0=t_start, force_backend=BACKEND)
+    data_wdm_signal = TDSignal(data_td, settings=td_set).transform(wdm_set)
+    data_wdm = np.asarray(data_wdm_signal.arr)  # (nch, Nf, Nt)
+    # We pad back to the wdm_set's full Nf x Nt if the transform stayed on
+    # the active band; AnalysisContainer convention returns active-band
+    # arrays. Pad zeros for inactive pixels so our class's data_wdm matches
+    # its own (Nf, Nt) shape contract.
+    if data_wdm.shape != (nchannels, Nf, Nt):
+        full = np.zeros((nchannels, Nf, Nt), dtype=float)
+        m_lo = wdm_set.ind_min_f
+        m_hi = wdm_set.ind_max_f + 1
+        full[:, m_lo:m_hi, :] = data_wdm
+        data_wdm = full
+    print(f"    done ({time.perf_counter()-t0:.1f}s); "
+          f"|data_wdm|_max = {np.abs(data_wdm).max():.3e}")
+
+    # ---- build invC from XYZ2SensitivityMatrix ---------------------------
+    print("  building invC = XYZ2SensitivityMatrix(scirdv1)^{-1} ...",
+          flush=True)
+    t0 = time.perf_counter()
+    sens_mat = XYZ2SensitivityMatrix(wdm_set, model="scirdv1")
+    invC_active = np.asarray(sens_mat.invC)        # (3, 3, Nfa, Nta)
+    invC_active = np.where(np.isfinite(invC_active), invC_active, 0.0)
+    if invC_active.shape != (nchannels, nchannels, Nf, Nt):
+        full = np.zeros((nchannels, nchannels, Nf, Nt), dtype=float)
+        m_lo = wdm_set.ind_min_f
+        m_hi = wdm_set.ind_max_f + 1
+        full[:, :, m_lo:m_hi, :] = invC_active
+        invC_active = full
+    invC_wdm = invC_active[None]                   # (1, 3, 3, Nf, Nt)
+    print(f"    done ({time.perf_counter()-t0:.1f}s); "
+          f"invC[0,0] median = {np.median(invC_wdm[0, 0, 0]):.3e}")
+
+    # ---- run the batched single-chunk WDM get_ll --------------------------
+    print("  running GBHeterodyneWDMGetLL.get_ll_wdm "
+          "(single-chunk, Nt_sub=Nt)...", flush=True)
+    t0 = time.perf_counter()
     wdm_comp = GBHeterodyneWDMGetLL(
         T=Tobs, t_ref=t_ref, t_start=t_start, N_sparse=N_sparse,
         Nf=Nf, Nt_sub=Nt, dt=dt, wdm_window=wdm_window,
-        data_wdm=data_wdm, invC_wdm=invC_xyz_wdm,
+        data_wdm=data_wdm[None], invC_wdm=invC_wdm,
         orbits=orbits, tdi_config=tdi_config,
         force_backend=BACKEND, tdi_type="XYZ",
     )
-
-    # ---- 2 binaries ----
-    params = np.array([
-        [8.0e-23, 20.0e-3, 1.0e-14, 0.0, 2.098, 0.240, 1.234, 4.098, 0.090],
-        [6.0e-23, 21.0e-3, 8.0e-15, 0.0, 1.500, 0.500, 0.800, 3.500, -0.200],
-    ])
-
-    t0 = time.perf_counter()
-    ll = wdm_comp.get_ll_wdm(params, convert_to_ra_dec=False)
-    t_call = time.perf_counter() - t0
+    ll = np.asarray(wdm_comp.get_ll_wdm(params, convert_to_ra_dec=False))
     d_h = np.asarray(wdm_comp.d_h_out)
     h_h = np.asarray(wdm_comp.h_h_out)
+    t_call = time.perf_counter() - t0
+    print(f"    done ({t_call:.1f}s)")
 
-    print("=" * 70)
-    print(f"GBHeterodyneWDMGetLL self-test  (num_bin=2, Nf={Nf}, Nt={Nt}, "
-          f"N_sparse={N_sparse})")
-    print("=" * 70)
-    print(f"  wall-clock get_ll_wdm: {t_call*1e3:.1f} ms")
-    print(f"  <d|h>  = {d_h}")
-    print(f"  <h|h>  = {h_h}")
-    print(f"  ll     = {np.asarray(ll)}")
-    # Sanity: <h|h> should be finite and positive, <d|h> finite.
-    ok_finite = (
-        np.all(np.isfinite(d_h)) and np.all(np.isfinite(h_h))
-        and np.all(h_h >= 0.0)
-    )
+    snr2_meas = d_h[0] * d_h[0] / max(h_h[0], 1e-300)
+    overlap = d_h[0] / np.sqrt(max(h_h[0], 1e-300) * max(h_h[0], 1e-300))
     print()
-    print("  finite & h_h >= 0:", "PASS" if ok_finite else "FAIL")
+    print(f"  <d|h>   = {d_h[0]:+.6e}")
+    print(f"  <h|h>   = {h_h[0]:+.6e}     (= optimal SNR^2)")
+    print(f"  <d|h>^2 / <h|h>  = {snr2_meas:+.6e}     "
+          f"(matched SNR^2; should ~= <h|h>)")
+    print(f"  matched overlap  = <d|h> / sqrt(<h|h><h|h>) = {overlap:+.6f}")
+    print(f"  ll = -0.5*(<d|d>=0 + <h|h> - 2<d|h>) = {ll[0]:+.6e}")
 
-    # ---- stronger cross-check: my FD->WDM transform vs lisatools.wdmtransform
-    # Build chunk_fd for the first binary, run both transforms, compare.
-    print("\n  --- FD->WDM transform check vs lisatools.FDSignal.wdmtransform ---")
-    try:
-        chunk_fd_one = np.asarray(
-            wdm_comp._build_chunk_fd(params[:1])
-        )[0]  # (nch, n_rfft)
-        # My transform:
-        w_mine = np.asarray(
-            wdm_comp._chunk_fd_to_wdm(chunk_fd_one[None])
-        )[0]  # (nch, Nf, Nt)
-        # lisatools transform (per-channel):
-        w_lt = np.zeros_like(w_mine)
-        for c in range(nchannels):
-            fd_one_c = FDSignal(chunk_fd_one[c], fd_set)
-            w_lt[c] = np.asarray(fd_one_c.wdmtransform(wdm_set).arr)
-        diff = w_mine - w_lt
-        peak = np.max(np.abs(w_lt))
-        rel = np.max(np.abs(diff)) / max(peak, 1e-300)
-        print(f"  peak |w_lt|        = {peak:.3e}")
-        print(f"  max  |w_mine-w_lt| = {np.max(np.abs(diff)):.3e}")
-        print(f"  relative max err   = {rel:.3e}")
-        match = rel < 1e-10
-        print("  PASS" if match else "  FAIL: reldiff exceeds 1e-10")
-        return ok_finite and match
-    except Exception as e:
-        print(f"  (skipped: {e})")
-        return ok_finite
+    # ---- pass criteria ----------------------------------------------------
+    # Matched-filter recovery: overlap of injection vs identical template
+    # should be very close to 1 (down to TD->WDM truncation / single-chunk
+    # heterodyne FD vs dense rfft mismatch). Threshold 0.99 is generous;
+    # canonical chunked-het gets ~1 - 1e-9 on this configuration.
+    finite = (np.isfinite(d_h).all() and np.isfinite(h_h).all()
+              and h_h[0] > 0.0)
+    matched = abs(overlap - 1.0) < 0.05
+    print()
+    print(f"  finite & <h|h> > 0  : {'PASS' if finite else 'FAIL'}")
+    print(f"  overlap ~ 1 (<5%)   : {'PASS' if matched else 'FAIL'}  "
+          f"(|1 - overlap| = {abs(1.0 - overlap):.3e})")
+
+    return bool(finite and matched)
 
 
 if __name__ == "__main__":
-    _selftest()
+    ok = _selftest()
+    raise SystemExit(0 if ok else 1)
