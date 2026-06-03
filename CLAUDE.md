@@ -34,6 +34,18 @@ TDSplineTDIWaveform) are still defined + registered in lisa-on-gpu's
 `computation_group.py`. When the carve-out happens, the L2 enforcement
 will catch any accidental duplicate registration at compile time.
 
+**In-flight (separate from the carve-out)**: The **v2 polyphase signal-
+heterodyne** C++ port. Independent work-item with its own plan at
+`~/.claude/plans/yes-find-and-read-sprightly-garden.md`. Adds generic
+primitives (`SignalHetPolyphase`, `SignalHetConvert`,
+`SignalHetReconstruct`, `SignalHetBinFold`, `signal_het_views.hpp`,
+`SignalHetComputationsBase`) to LAT, and GB/SOBBH-specific
+`{GB,SOBBH}AbsoluteFD` + `{GB,SOBBH}SignalHet` to GBGPU/BBHx. Python
+prototype lives at `LISAanalysistools/scripts/gb_chunked_het/gb_signal_het_wdm_v2.py`
+(mm5 ≈ 1.6e-9 median, ~130× faster than v1 dense path). First C++
+artifact (POD view structs) lives at `scripts/gb_chunked_het/signal_het_cpp/signal_het_views.hpp`
+and moves to `LISAanalysistools/src/lisatools/cutils/` at landing.
+
 **Sprint-root tooling**:
 - `tools/check_single_registrant.sh` — runs the L2 grep gate.
 - `constraints/sprint.txt` — the pybind11 pin.
