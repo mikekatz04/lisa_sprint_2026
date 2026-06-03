@@ -57,6 +57,10 @@ FORBIDDEN_CLASSES=(
     "WDMSettingsWrap"
     "WDMDomain"
     "WDMDomainWrap"
+    "FDSplineTDIWaveform"
+    "FDSplineTDIWaveformWrap"
+    "TDSplineTDIWaveform"
+    "TDSplineTDIWaveformWrap"
 )
 
 violations=0
