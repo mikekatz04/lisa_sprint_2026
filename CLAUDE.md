@@ -7,6 +7,37 @@ all of them — when a sub-repo has its own `CLAUDE.md`, it should also
 state this rule so it remains visible when that repo is opened
 standalone.
 
+## Current architecture (post-Phase-3, 2026-06-02)
+
+The sprint is mid-reorg. Treat **LISAanalysistools (LAT)** as the central
+LISA-physics library; `lisa-on-gpu` is being deprecated into LAT and the
+waveform packages.
+
+| What | Lives where | Notes |
+|---|---|---|
+| Generic LISA response / TDI Python | `lisatools.response.{directresponse,tdionfly,tdiconfig,parallelbase}` | Absorbed from `fastlisaresponse.*` at Phase 3B+C; old paths still work via deprecation shims |
+| Generic LISA-response JAX | `lisatools.jax.response.{base,projection,tdi_config,amp_phase_extract}` | Absorbed Phase 3D |
+| Generic WDM JAX | `lisatools.jax.wdm.{wdm_settings,wdm_domain,wavelet_lookup,fast_inner}` | Absorbed Phase 3D |
+| `LISAResponse.cu/.hh` + `binding_flr.cxx/.hpp` | `LISAanalysistools/src/lisatools/cutils/` | Absorbed Phase 3E; lisa-on-gpu's `responselisa` pybind11 module **retired** |
+| Response classes (LISAResponseWrap, TDIConfigWrap, OrbitsWrap_responselisa, CubicSplineWrap_responselisa) | Registered ONLY in `lisatools_backend_*.pycppdetector` | Phase 3E; consumers source via `lisatools_backend_*.pycppdetector` not `fastlisaresponse_backend_*.responselisa` |
+| GB-specific JAX (ucb, wdm kernels, heterodyne, fast_inner_heterodyne) | `gbgpu.jax.{sources,wdm}` | Absorbed Phase 3F |
+| SOBBH-specific JAX (sobbh source) | `bbhx.jax.sources` | Absorbed Phase 3G |
+| Sprint-wide pybind11 pin (L1) | `constraints/sprint.txt` (export `PIP_CONSTRAINT=$(pwd)/constraints/sprint.txt` before every `pip install`) | Phase 2b |
+| Single-registrant rule (L2) | `LISATOOLS_IS_WRAPPER_OWNER` macro in `lisatools_header_abi.hpp` + per-TU `static_assert` (Phase 3J) + `tools/check_single_registrant.sh` grep gate (Phase 3K) | Two-layer enforcement; intentional-violation test proven |
+| OrbitsView POD (L3) | `lisatools/cutils/orbits_view.hpp`; layout asserted at every LAT build via `binding.cxx` `static_assert(sizeof + 15 offsetofs)` | Phase 2b + 3J |
+
+**Deferred to a future session**: The C++ `TDIonTheFly.cu` carve-out (11k-line
+file split into generic/GB/SOBBH). Generic classes (LISATDIonTheFly,
+WDMSettings, WDMDomain, FDDomain, WaveletLookupTable, FDSplineTDIWaveform,
+TDSplineTDIWaveform) are still defined + registered in lisa-on-gpu's
+`tdionthefly` pybind11 module. Same for `gbcomps.py` and JAX
+`computation_group.py`. When the carve-out happens, the L2 enforcement
+will catch any accidental duplicate registration at compile time.
+
+**Sprint-root tooling**:
+- `tools/check_single_registrant.sh` — runs the L2 grep gate.
+- `constraints/sprint.txt` — the pybind11 pin.
+
 ## Backend implementation hierarchy
 
 When implementing or modifying an algorithm that exists across multiple
