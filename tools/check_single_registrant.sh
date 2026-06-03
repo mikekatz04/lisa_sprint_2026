@@ -55,6 +55,8 @@ FORBIDDEN_CLASSES=(
     "FDDomainWrap"
     "WDMSettings"
     "WDMSettingsWrap"
+    "WDMDomain"
+    "WDMDomainWrap"
 )
 
 violations=0
