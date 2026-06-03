@@ -7,7 +7,7 @@ all of them — when a sub-repo has its own `CLAUDE.md`, it should also
 state this rule so it remains visible when that repo is opened
 standalone.
 
-## Current architecture (post-Phase-3, 2026-06-02)
+## Current architecture (post-Phase-3L.6, 2026-06-03)
 
 The sprint is mid-reorg. Treat **LISAanalysistools (LAT)** as the central
 LISA-physics library; `lisa-on-gpu` is being deprecated into LAT and the
@@ -22,17 +22,27 @@ waveform packages.
 | Response classes (LISAResponseWrap, TDIConfigWrap, OrbitsWrap_responselisa, CubicSplineWrap_responselisa) | Registered ONLY in `lisatools_backend_*.pycppdetector` | Phase 3E; consumers source via `lisatools_backend_*.pycppdetector` not `fastlisaresponse_backend_*.responselisa` |
 | GB-specific JAX (ucb, wdm kernels, heterodyne, fast_inner_heterodyne) | `gbgpu.jax.{sources,wdm}` | Absorbed Phase 3F |
 | SOBBH-specific JAX (sobbh source) | `bbhx.jax.sources` | Absorbed Phase 3G |
+| **TDIonTheFly C++ Phase 3L** | LAT `lisatools/cutils/` | See sub-phase table below |
 | Sprint-wide pybind11 pin (L1) | `constraints/sprint.txt` (export `PIP_CONSTRAINT=$(pwd)/constraints/sprint.txt` before every `pip install`) | Phase 2b |
-| Single-registrant rule (L2) | `LISATOOLS_IS_WRAPPER_OWNER` macro in `lisatools_header_abi.hpp` + per-TU `static_assert` (Phase 3J) + `tools/check_single_registrant.sh` grep gate (Phase 3K) | Two-layer enforcement; intentional-violation test proven |
+| Single-registrant rule (L2) | `LISATOOLS_IS_WRAPPER_OWNER` macro in `lisatools_header_abi.hpp` + per-TU `static_assert` (Phase 3J) + `tools/check_single_registrant.sh` grep gate (Phase 3K) | Two-layer enforcement; intentional-violation test proven; FORBIDDEN list extended each 3L sub-phase |
 | OrbitsView POD (L3) | `lisatools/cutils/orbits_view.hpp`; layout asserted at every LAT build via `binding.cxx` `static_assert(sizeof + 15 offsetofs)` | Phase 2b + 3J |
 
-**Deferred to a future session**: The C++ `TDIonTheFly.cu` carve-out (11k-line
-file split into generic/GB/SOBBH). Generic classes (LISATDIonTheFly,
-WDMSettings, WDMDomain, FDDomain, WaveletLookupTable, FDSplineTDIWaveform,
-TDSplineTDIWaveform) are still defined + registered in lisa-on-gpu's
-`tdionthefly` pybind11 module. Same for `gbcomps.py` and JAX
-`computation_group.py`. When the carve-out happens, the L2 enforcement
-will catch any accidental duplicate registration at compile time.
+### Phase 3L sub-phases (TDIonTheFly C++ carve-out, 2026-06-02..03)
+
+| Sub-phase | What moved | Pattern | Status |
+|---|---|---|---|
+| 3L.1 | `FDDomain` + `FDDomainWrap` → LAT | header-inline | ✅ |
+| 3L.2 | `WDMSettings` + `WDMSettingsWrap` → LAT | header-inline | ✅ |
+| 3L.3 | `WaveletLookupTable` + `gb_wdm_spline_*` **retired** (lookup-table spline path) | `#if 0` in place | ✅ |
+| 3L.4 | `WDMDomain` + `WDMDomainWrap` → LAT | header-inline (12 methods) | ✅ |
+| 3L.5 | `LISATDIonTheFly` base + `OrbitsSplineCache` + 4 cache eval helpers → LAT | `.hh + .cu` split; lisa-on-gpu copy-compiles `.cu` | ✅ |
+| 3L.6 | `FDSpline/TDSplineTDIWaveform` + their `*Wrap` + `LISATDIonTheFlyWrap` base → LAT | `.hh + .cu` split + inline Wrap bodies | ✅ |
+| 3L.7 | `GBTDIonTheFly` + `GBComputationGroup` + `gb_wdm_het_*` kernels → GBGPU | **pending** — needs GBGPU pybind11 infra (currently Cython-only) | ⏳ |
+| 3L.8 | `SOBBHTDIonTheFly` + `SOBBHComputationGroup` → BBHx | **pending** — needs BBHx pybind11 infra path | ⏳ |
+
+**Phase 3L pattern (refined across 6 sub-phases):** small header-only classes go header-inline; larger classes with `.cu` bodies use the `.hh + .cu` split with lisa-on-gpu's CMake copy-compiling the `.cu` (same pattern as Phase 3E's LISAResponse.cu). LAT *also* compiles the `.cu` into its own static archive so the pybind11-registered virtual-class typeinfo lives in LAT's `.so` (otherwise downstream import dlopen-fails on missing `__ZTI*` symbols).
+
+**Phase 3L.7/3L.8 blocker:** GBGPU + BBHx currently use Cython bindings (`.pyx`), not pybind11. Setting up pybind11 module infrastructure equivalent to LAT's `pycppdetector` is a prerequisite. Until then, GB/SOBBH `*TDIonTheFly` + `*ComputationGroup` classes stay in lisa-on-gpu's `tdionthefly` module.
 
 **In-flight (separate from the carve-out)**: The **v2 polyphase signal-
 heterodyne** C++ port. Independent work-item with its own plan at
