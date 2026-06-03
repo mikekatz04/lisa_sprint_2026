@@ -49,10 +49,12 @@ FORBIDDEN_CLASSES=(
     "TDIConfigWrap"
     "CubicSplineWrap_responselisa"
     "OrbitsWrap_responselisa"
-    # Phase 3L (2026-06-02): TDIonTheFly carve-out begins. FDDomain + FDDomainWrap
-    # now live in LAT (lisatools/cutils/fd_domain.hh + binding_fd_domain.hpp).
+    # Phase 3L (2026-06-02): TDIonTheFly carve-out begins. Classes moved
+    # so far live in LAT under lisatools/cutils/.
     "FDDomain"
     "FDDomainWrap"
+    "WDMSettings"
+    "WDMSettingsWrap"
 )
 
 violations=0
