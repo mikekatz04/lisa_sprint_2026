@@ -42,7 +42,24 @@ waveform packages.
 
 **Phase 3L pattern (refined across 6 sub-phases):** small header-only classes go header-inline; larger classes with `.cu` bodies use the `.hh + .cu` split with lisa-on-gpu's CMake copy-compiling the `.cu` (same pattern as Phase 3E's LISAResponse.cu). LAT *also* compiles the `.cu` into its own static archive so the pybind11-registered virtual-class typeinfo lives in LAT's `.so` (otherwise downstream import dlopen-fails on missing `__ZTI*` symbols).
 
-**Phase 3L.7/3L.8 blocker:** GBGPU + BBHx currently use Cython bindings (`.pyx`), not pybind11. Setting up pybind11 module infrastructure equivalent to LAT's `pycppdetector` is a prerequisite. Until then, GB/SOBBH `*TDIonTheFly` + `*ComputationGroup` classes stay in lisa-on-gpu's `tdionthefly` module.
+**Phase 3L.7/3L.8 status (2026-06-04):** GBGPU + BBHx pybind11
+infrastructure is now in place (commits `ce9f778` / `8966c1f` and
+their pred dependencies — `cgbgpu` and `cbbhx` modules with empty
+`{GB,BBHx}ComputationWrap` shells exposed alongside any remaining
+Cython modules). The wholesale GB/SOBBH source carve-out is still
+pending — TDIonTheFly.cu contains ~2000 lines of templated chunked-het
+kernels (`wdm_het_*_kernel`/`*_impl<SourceT>` shared between GB and
+SOBBH) that have to land in a LAT-side header before either
+source-class carve-out is safe. Phase 3L.7a (templated kernel
+extraction → LAT) is the prerequisite for 3L.7 and 3L.8; planned for
+a dedicated session.
+
+**Phase 3.dedup (2026-06-04):** GBGPU + BBHx local `cuda_complex.hpp`
+duplicates (1305 lines each, functionally identical to GBT's modulo
+inline-brace whitespace) deleted. Includes resolve via `${GBT_CUTILS}`
+already on each downstream's `target_include_directories`. GBT remains
+the sole sprint-wide source for `cuda_complex.hpp`. FEW's intentionally-
+diverged copy (with `std::` qualifications) left untouched per plan.
 
 **In-flight (separate from the carve-out)**: The **v2 polyphase signal-
 heterodyne** C++ port. Independent work-item with its own plan at
