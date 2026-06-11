@@ -234,7 +234,7 @@ and side-loadable — that is what lets `has_backend("cpu")` and
 
 ### 3.6 Host → device upload of wrapper structs
 
-Pybind11/nanobind wrapper classes (`OrbitsWrap_responselisa`,
+Pybind11/nanobind wrapper classes (`OrbitsWrap`,
 `TDIConfigWrap`, `WDMSettingsWrap`, `WDMDomainWrap`, `FDDomainWrap`,
 …) store their underlying C++ struct via plain `new` on the **host
 heap**. The pointer fields *inside* the struct may already point to

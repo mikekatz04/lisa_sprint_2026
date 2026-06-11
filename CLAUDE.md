@@ -19,7 +19,7 @@ waveform packages.
 | Generic LISA-response JAX | `lisatools.jax.response.{base,projection,tdi_config,amp_phase_extract}` | Absorbed Phase 3D |
 | Generic WDM JAX | `lisatools.jax.wdm.{wdm_settings,wdm_domain,wavelet_lookup,fast_inner}` | Absorbed Phase 3D |
 | `LISAResponse.cu/.hh` + `binding_flr.cxx/.hpp` | `LISAanalysistools/src/lisatools/cutils/` | Absorbed Phase 3E; lisa-on-gpu's `responselisa` pybind11 module **retired** |
-| Response classes (LISAResponseWrap, TDIConfigWrap, OrbitsWrap_responselisa, CubicSplineWrap_responselisa) | Registered ONLY in `lisatools_backend_*.pycppdetector` | Phase 3E; consumers source via `lisatools_backend_*.pycppdetector` not `fastlisaresponse_backend_*.responselisa` |
+| Response classes (LISAResponseWrap, TDIConfigWrap, OrbitsWrap, CubicSplineWrap) | Registered ONLY in `lisatools_backend_*.pycppdetector` | Phase 3E; consumers source via `lisatools_backend_*.pycppdetector` not `fastlisaresponse_backend_*.responselisa` |
 | GB-specific JAX (ucb, wdm kernels, heterodyne, fast_inner_heterodyne) | `gbgpu.jax.{sources,wdm}` | Absorbed Phase 3F |
 | SOBBH-specific JAX (sobbh source) | `bbhx.jax.sources` | Absorbed Phase 3G |
 | **TDIonTheFly C++ Phase 3L** | LAT `lisatools/cutils/` | See sub-phase table below |
@@ -158,15 +158,15 @@ Eryn, plus any repo-root scripts in the sprint tree).
 
 ## Host→device upload of class-wrapper objects (sprint-wide rule)
 
-Pybind11 wrapper classes in this codebase (`OrbitsWrap_responselisa`,
+Pybind11 wrapper classes in this codebase (`OrbitsWrap`,
 `TDIConfigWrap`, `WDMSettingsWrap`, `WDMDomainWrap`, `FDDomainWrap`,
 `AnalysisContainerArrayWrap`, …) store their underlying C++ instance
 via plain ``new`` on the **host** heap, e.g.
 
 ```cpp
-class OrbitsWrap_responselisa : public ReturnPointerBase {
+class OrbitsWrap : public ReturnPointerBase {
     Orbits *orbits;
-    OrbitsWrap_responselisa(...) {
+    OrbitsWrap(...) {
         orbits = new Orbits(..., _ltt_arr_device_ptr, ...);
         //       ^^^^^^^^^^ host allocation; pointer fields inside
         //                  may already point to device memory.
