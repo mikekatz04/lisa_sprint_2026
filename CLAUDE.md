@@ -344,6 +344,59 @@ side-loadable in the same process. This is what allows
 simultaneously.
 
 
+## Deepcopy / pickle safety (sprint-wide rule)
+
+Objects in this codebase routinely travel through ``copy.deepcopy``
+(``CurrentInfoGlobalFit`` deepcopies the whole settings tree) and
+``pickle`` (MPI workers, multiprocessing, cached states). Any object
+graph that transitively holds a raw Python **module** dies in both with
+``TypeError: cannot pickle 'module' object``. Rules:
+
+1. **Never store an array module as an instance attribute.**
+   ``self.xp = cp`` / ``self._xp = cp if use_cupy else np`` /
+   ``self.xp = other.xp`` are all forbidden. Store the *flag or name*
+   and expose the module as a **property**:
+
+   ```python
+   @property
+   def xp(self):
+       return cp if self.use_cupy else np      # flag-derived
+   # or, for backend-managed classes (preferred):
+   @property
+   def xp(self):
+       return self.backend.xp                  # Backend resolves by name
+   ```
+
+   ``LISAToolsParallelModule`` / ``ParallelModuleBase`` subclasses get
+   this for free — ``self.backend`` is itself name-resolved
+   (``_backend_name`` string) and ``Backend`` pickles as a registry-name
+   reference (``Backend.__reduce__``, GBT ``bd6355c``) and
+   deepcopies to itself (singleton). Do not bypass that by caching
+   ``self.xp = self.backend.xp`` at construction.
+
+2. **``__getattr__`` delegators must guard their storage attribute and
+   dunders.** ``copy`` / ``pickle`` probe half-constructed objects for
+   hooks (``__deepcopy__``, ``__reduce_ex__``, ``__getstate__``,
+   ``__setstate__``) *before* ``__init__`` has run; an unguarded
+   ``return getattr(self._inner, name)`` recurses to RecursionError.
+   Pattern (see ``_GPUPriorWrapper``):
+
+   ```python
+   def __getattr__(self, name):
+       if name == "_inner" or (name.startswith("__") and name.endswith("__")):
+           raise AttributeError(name)
+       return getattr(self._inner, name)
+   ```
+
+3. Other known-unpicklable attributes (nanobind wraps like
+   ``OrbitsWrap`` / comp objects, open HDF5 files, cupy streams) must
+   not live on objects that enter the settings tree or cross process
+   boundaries — hold them on runtime-only objects, rebuild them lazily
+   (property), or keep the picklable *args* and reconstruct.
+
+When adding a class that will live in a settings tree, prove it with
+``pickle.loads(pickle.dumps(copy.deepcopy(obj)))`` in its unit test.
+
 ## Narrowband mismatches mm2 / mm5 (chunked-het / WDM validation)
 
 When verifying a chunked-heterodyne or other narrowband WDM template
