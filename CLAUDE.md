@@ -129,6 +129,29 @@ each backend against the others at the inner-product level before
 merging.
 
 
+## No new global-fit settings files (sprint-wide rule)
+
+Global-fit run configurations are **installed stock classes**
+(`LISAanalysistools`, branch reorg-top-layer, 2026-07-09), not settings
+files:
+
+```python
+from lisatools.globalfit.stock import erebor
+fit = erebor.gb_no_fg(nwalkers=4)      # or get_stock("gb_no_fg", ...); also
+fit.gb.center_freq = 8e-3              #   all_sources, full_year_combined
+fit.recipe.pop_move("rj_refit")        # named move stacks per recipe stage
+fit.build(); fit.run()                 # heavy work only on command
+```
+
+A new run variant is a `StockGlobalFit` subclass under
+`lisatools/globalfit/stock/erebor/variants/` (knobs = documented dataclass
+fields; env vars resolve as field defaults, explicit kwargs win; nothing
+heavy in `__init__`; the pre-build fit must pickle/deepcopy). The
+`LISAanalysistools/global_fit_input/*.py` files for migrated variants are
+compatibility stubs — do not grow them back. Full rules + architecture in
+`LISAanalysistools/CLAUDE.md` ("Stock global fits").
+
+
 ## No backend strings as function kwargs (sprint-wide rule)
 
 When a class or function needs a compute backend (CPU C++, CUDA C++,
