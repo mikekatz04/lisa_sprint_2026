@@ -16,6 +16,12 @@ Start here:
   backend-wheel model) →
   [`LISAanalysistools/docs/architecture-map.md`](LISAanalysistools/docs/architecture-map.md)
 - **Per-repo maps** → `<repo>/docs/codebase-map.md`
+- **Global-fit production work** (where everything in the pipeline lives,
+  how to move through it without reading the whole tree) →
+  [`LISAanalysistools/docs/global-fit-navigation.md`](LISAanalysistools/docs/global-fit-navigation.md)
+- **Examining a production run** (the deep-dive routine, the health
+  checklist, how the gating is read, known failure signatures, rulings) →
+  [`LISAanalysistools/docs/global-fit-deep-dives.md`](LISAanalysistools/docs/global-fit-deep-dives.md)
 - **LAT-specific guidance** (build/test/lint, backend architecture, stock
   global fits, ...) → [`LISAanalysistools/CLAUDE.md`](LISAanalysistools/CLAUDE.md)
 
